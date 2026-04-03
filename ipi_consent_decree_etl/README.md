@@ -1,0 +1,78 @@
+# IPI Consent Decree ETL
+
+Pulls EPA ECHO enforcement data for municipal water/wastewater consent decrees,
+enriches with Census population data, and loads into Google BigQuery.
+
+Built for **IPI Pipe** to power a sales intelligence dashboard identifying
+municipalities under Clean Water Act or wastewater consent decrees.
+
+## Data Sources
+
+- **EPA ECHO API** — Enforcement and Compliance History Online (free, no key required)
+- **US Census Bureau ACS** — American Community Survey 5-year population estimates (free, key required)
+
+## Setup
+
+```bash
+# 1. Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Configure environment variables
+cp .env.example .env
+# Edit .env with your values:
+#   - GCP_PROJECT_ID: Your Google Cloud project ID
+#   - GOOGLE_APPLICATION_CREDENTIALS: Path to your BigQuery service account JSON key
+#   - CENSUS_API_KEY: Free key from https://api.census.gov/data/key_signup.html
+```
+
+## Usage
+
+```bash
+# Full run — all states, load to BigQuery
+python etl.py
+
+# Dry run — pull and transform only, no BigQuery write
+python etl.py --dry-run
+
+# Single state for testing
+python etl.py --state TX
+
+# Combine flags
+python etl.py --dry-run --state TX
+```
+
+## Output
+
+- **BigQuery**: `ipi_intelligence.consent_decrees` table with UPSERT logic (no duplicates on rerun)
+- **Logs**: `logs/etl.log` (rotating, 5 MB max, 5 backups)
+- **Console**: Real-time progress and run summary
+
+## Schema
+
+| Field | Type | Description |
+|-------|------|-------------|
+| case_number | STRING | Unique case identifier (merge key) |
+| registry_id | STRING | EPA Registry ID |
+| fips_code | STRING | County FIPS code |
+| facility_name | STRING | Municipality / facility name |
+| city | STRING | City |
+| state | STRING | Two-letter state code |
+| zip_code | STRING | ZIP code |
+| county | STRING | County name |
+| consent_decree_date | DATE | Date consent decree was issued |
+| compliance_end_date | DATE | Compliance schedule end date |
+| lead_agency | STRING | EPA Region, State, or DOJ |
+| action_type | STRING | Type of enforcement action |
+| violation_type | STRING | Violation description |
+| penalty_amount | FLOAT64 | Penalty amount in USD |
+| statute | STRING | Governing statute (CWA, SDWA) |
+| population | INT64 | County population (Census ACS) |
+| days_to_deadline | INT64 | Days until compliance deadline |
+| urgency_tier | STRING | critical / high / medium / low / overdue / unknown |
+| latitude | FLOAT64 | Facility latitude |
+| longitude | FLOAT64 | Facility longitude |
+| last_updated | TIMESTAMP | Last ETL refresh timestamp |

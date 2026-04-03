@@ -1,0 +1,34 @@
+# Credentials — NEVER commit these
+service-account.json
+*.json
+!package.json
+
+# Environment files
+.env
+.env.*
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit secrets (for local testing)
+.streamlit/secrets.toml
+
+# ETL artifacts
+logs/
+.last_refresh
+validation_report.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
