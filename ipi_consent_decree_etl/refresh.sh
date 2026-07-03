@@ -32,10 +32,17 @@ python "$SCRIPT_DIR/populate_population.py" --update 2>&1 | tee -a "$LOG"
 echo "[5/7] Backfilling derived columns (signals + size tiers)..." | tee -a "$LOG"
 python "$SCRIPT_DIR/backfill_signals.py" 2>&1 | tee -a "$LOG"
 
-echo "[6/7] Exporting qualified target list (Layer 3a)..." | tee -a "$LOG"
+echo "[6/8] Scanning news for infrastructure incidents..." | tee -a "$LOG"
+python "$SCRIPT_DIR/incident_monitor.py" 2>&1 | tee -a "$LOG" || true
+
+echo "[7/8] Exporting qualified target list (Layer 3a)..." | tee -a "$LOG"
 python "$SCRIPT_DIR/export_targets.py" 2>&1 | tee -a "$LOG"
 
-echo "[7/7] Running data validation (with auto-fix)..." | tee -a "$LOG"
+echo "[8/8] Running data validation (with auto-fix)..." | tee -a "$LOG"
 python "$SCRIPT_DIR/validate_data.py" --fix 2>&1 | tee -a "$LOG" || true
+
+# Stamp the refresh so the dashboard's "Last refreshed" caption is accurate
+# (previously only the dashboard's own refresh button wrote this).
+date "+%Y-%m-%d %H:%M" > "$SCRIPT_DIR/.last_refresh"
 
 echo "=== IPI ETL Refresh completed at $(date) ===" | tee -a "$LOG"

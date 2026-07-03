@@ -382,6 +382,7 @@ def load_qualified_targets() -> pd.DataFrame:
         return client.query("""
             SELECT city, state, size_tier, best_signal_type,
                    n_signals, n_state_actions, n_federal_decrees, n_dmr,
+                   n_recent_incidents,
                    latest_signal_date, total_penalties, population,
                    priority_score, has_stakeholders
             FROM `ipi_intelligence.qualified_targets`
@@ -389,6 +390,57 @@ def load_qualified_targets() -> pd.DataFrame:
         """).to_dataframe()
     except Exception:
         return pd.DataFrame()  # table not exported yet
+
+
+@st.cache_data(ttl=300)
+def load_incidents() -> pd.DataFrame:
+    """Load recent news incidents from the incident monitor (last 30 days)."""
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    try:
+        return client.query("""
+            SELECT published_at, city, state, incident_type, headline,
+                   url, news_source
+            FROM `ipi_intelligence.incident_reports`
+            WHERE published_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+              AND NOT dismissed
+            ORDER BY published_at DESC
+            LIMIT 200
+        """).to_dataframe()
+    except Exception:
+        return pd.DataFrame()  # monitor hasn't run yet
+
+
+def render_incidents(incidents: pd.DataFrame):
+    """Live incident feed — the 'reach out ASAP' trigger list."""
+    st.markdown("#### Live Incidents — Last 30 Days")
+    st.caption(
+        "News-monitored sewer overflows, boil-water advisories, and water-"
+        "infrastructure incidents across Medium/Large qualified targets. "
+        "An incident here + a contact in HubSpot = same-week outreach window. "
+        "Municipalities with incidents get +10 priority score."
+    )
+    if incidents.empty:
+        st.info(
+            "No incidents on record yet — the monitor runs with each data "
+            "refresh (or cron `incident_monitor.py` daily for same-day alerts)."
+        )
+        return
+    st.dataframe(
+        incidents,
+        column_config={
+            "published_at": st.column_config.DatetimeColumn("Published", format="MMM DD, HH:mm"),
+            "city": st.column_config.TextColumn("Municipality"),
+            "state": st.column_config.TextColumn("State", width="small"),
+            "incident_type": st.column_config.TextColumn("Type", width="small"),
+            "headline": st.column_config.TextColumn("Headline", width="large"),
+            "url": st.column_config.LinkColumn("Link", display_text="open"),
+            "news_source": st.column_config.TextColumn("Source"),
+        },
+        use_container_width=True,
+        height=380,
+        hide_index=True,
+    )
 
 
 def render_top_targets(targets: pd.DataFrame):
@@ -419,6 +471,7 @@ def render_top_targets(targets: pd.DataFrame):
             "n_state_actions": st.column_config.NumberColumn("State", format="%d"),
             "n_federal_decrees": st.column_config.NumberColumn("Fed CD", format="%d"),
             "n_dmr": st.column_config.NumberColumn("DMR", format="%d"),
+            "n_recent_incidents": st.column_config.NumberColumn("Incidents 90d", format="%d"),
             "latest_signal_date": st.column_config.DateColumn("Latest Signal", format="YYYY-MM-DD"),
             "total_penalties": st.column_config.NumberColumn("Penalties", format="$%,.0f"),
             "population": st.column_config.NumberColumn("Population", format="%,d"),
@@ -1300,6 +1353,10 @@ def main():
     # Top priority targets (Layer 4 municipality-grain ranking)
     st.markdown("---")
     render_top_targets(load_qualified_targets())
+
+    # Live incident feed (news monitor)
+    st.markdown("---")
+    render_incidents(load_incidents())
 
     # Map — all size tiers, independent of the ranked-list size filter
     st.markdown("---")

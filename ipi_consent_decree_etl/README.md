@@ -25,9 +25,22 @@ signal; QNCR/DMR effluent noncompliance is a near-real-time discovery tier.
 4. `populate_population.py --update` — Census population fill-in
 5. `backfill_signals.py` — derived columns: signal_type/signal_rank on seed
    rows + `size_tier` (Small <100k / Medium 100k-500k / Large 500k+)
-6. `export_targets.py` — **Layer 3a**: rebuilds `qualified_targets`
+6. `incident_monitor.py` — news monitor (Google News RSS) for sewer
+   overflows / boil-water / main breaks across Medium+Large targets →
+   `incident_reports`; fresh incidents add +10 to priority score.
+   **Cron daily for same-day outreach triggers** (refresh.sh also runs it):
+   `0 7 * * * cd <etl dir> && ./venv/bin/python incident_monitor.py`
+7. `export_targets.py` — **Layer 3a**: rebuilds `qualified_targets`
    (municipality-grain, priority-scored) + ensures `stakeholders_staging`
-7. `validate_data.py --fix` — data quality checks
+8. `validate_data.py --fix` — data quality checks
+
+## Data freshness
+
+- EPA publishes both bulk files weekly (typically Sat/Sun) — enforcement
+  data lags reality by ≤ ~1 week at refresh time
+- QNCR (DMR tier) is quarterly by nature — expect 1-4 months of lag; the
+  news monitor exists precisely to close that gap to same-day
+- Census ACS population: annual (fine for size tiers)
 
 Additional (manual):
 - `hubspot_sync.py` — **Layer 5**: pushes `approved` staging rows to HubSpot

@@ -23,6 +23,8 @@ Produces two BigQuery tables:
      - stakeholder reachability: +15 when the municipality has verified or
        approved contacts in stakeholders_staging (self-updates as Layer 3b
        research lands)
+     - live incident: +10 when incident_monitor.py found a news incident
+       (sewer overflow, boil-water, etc.) in the last 90 days
      - funding angle: +0 placeholder — SRF/BRIC eligibility enrichment is
        phase-2; column structure is in place so the score formula is stable
 
@@ -90,6 +92,17 @@ grouped AS (
   FROM keyed
   GROUP BY municipality_key
 ),
+incidents AS (
+  -- Recent news incidents from incident_monitor.py (last 90 days).
+  -- Fresh incidents are the "reach out ASAP" trigger — they add +10 and a
+  -- visible count so incident-driven targets float up the ranked list.
+  SELECT municipality_key, COUNT(*) AS n_recent_incidents,
+         MAX(published_at) AS latest_incident_at
+  FROM `{project}.ipi_intelligence.incident_reports`
+  WHERE published_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+    AND NOT dismissed  -- analyst-flagged false positives don't score
+  GROUP BY municipality_key
+),
 reachability AS (
   -- Approved/verified stakeholder contacts per municipality (Layer 3b output).
   -- Feeds the reachability component so the score self-updates as research lands.
@@ -102,6 +115,8 @@ scored AS (
   SELECT
     grouped.*,
     COALESCE(reachability.n_contacts, 0) AS n_stakeholder_contacts,
+    COALESCE(incidents.n_recent_incidents, 0) AS n_recent_incidents,
+    incidents.latest_incident_at,
     CASE
       WHEN population IS NULL THEN 'Unknown'
       WHEN population < 100000 THEN 'Small'
@@ -133,10 +148,12 @@ scored AS (
         END
       + IF(pipe_flagged, 10, 0)
       + IF(COALESCE(reachability.n_contacts, 0) > 0, 15, 0)  -- reachability
+      + IF(COALESCE(incidents.n_recent_incidents, 0) > 0, 10, 0)  -- live incident
       + 0  -- funding angle: phase-2 SRF/BRIC enrichment
     ) AS priority_score
   FROM grouped
   LEFT JOIN reachability USING (municipality_key)
+  LEFT JOIN incidents USING (municipality_key)
 )
 SELECT
   municipality_key, city, state, county, primary_facility,
@@ -148,6 +165,8 @@ SELECT
   priority_score,
   n_stakeholder_contacts,
   n_stakeholder_contacts > 0 AS has_stakeholders,
+  n_recent_incidents,
+  latest_incident_at,
   CURRENT_TIMESTAMP() AS exported_at
 FROM scored
 WHERE size_tier IN ({tier_list})
@@ -200,8 +219,11 @@ def main():
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
     client = bigquery.Client(project=project_id)
 
-    # Staging must exist BEFORE the export — the reachability CTE joins it
+    # Staging + incidents tables must exist BEFORE the export — the
+    # reachability and incidents CTEs join them (first-run safety).
     client.query(STAKEHOLDERS_STAGING_DDL.format(project=project_id)).result()
+    from incident_monitor import INCIDENTS_DDL
+    client.query(INCIDENTS_DDL.format(project=project_id)).result()
 
     # SQL placeholder for signal-volume inside aggregate scope
     sql = QUALIFIED_TARGETS_SQL.replace(
