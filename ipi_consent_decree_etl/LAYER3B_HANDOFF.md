@@ -27,12 +27,31 @@ ORDER BY priority_score DESC
 
 ## Roster to find, per municipality
 
-1. Mayor
-2. City council / board members — flag anyone on public works,
+1. Municipal water director / water utility director (operational buyer)
+2. Mayor
+3. City council / board members — flag anyone on public works,
    infrastructure, or finance committees
-3. City manager / public works director
-4. County commissioners — where the utility is county-run
-5. State legislator(s) covering the district — funding-advocacy angle
+4. City manager / public works director
+5. County commissioners — where the utility is county-run
+6. State legislator(s) covering the district — funding-advocacy angle
+
+## Contact-data bar (what makes a row outreach-ready)
+
+Every row needs **email and/or LinkedIn profile URL** — that's the
+activation requirement, not a nice-to-have:
+- **email** → HubSpot Sales Sequence (synced via hubspot_sync.py; rows
+  without email are skipped by the sync)
+- **linkedin_url** → HeyReach campaign
+
+A name with neither is research debt, not a lead. Prefer official .gov
+emails; personal emails only when nothing official exists.
+
+Set `ipi_audience_segment` per role:
+- "State Representative" — mayors, council/board members, county
+  commissioners, state legislators (political persona)
+- leave the existing IPI operational segment for water/utility directors
+  and public-works staff (check current values in HubSpot before writing;
+  the sync extends the enumeration automatically with whatever you set)
 
 ## Sources (in preference order)
 
@@ -57,6 +76,34 @@ Write one row per person. Schema highlights (full DDL in export_targets.py):
 - `hubspot_sync_status` — leave 'pending'; review flips to 'approved',
   then hubspot_sync.py pushes to HubSpot with
   ipi_audience_segment = "State Representative"
+
+## Paste-ready Cowork prompt (Texas pilot)
+
+> I'm doing stakeholder research for IPI (Impact Pipe Inspection —
+> infrastructure-intelligence positioning, see ipi-pipe.com). Input: the
+> BigQuery table `ipi-consent-decree-dashboard.ipi_intelligence.qualified_targets`
+> — start with `WHERE state = 'TX' ORDER BY priority_score DESC` (52
+> Medium/Large municipalities). For each municipality, working top-down by
+> priority_score, find: the municipal water / water-utility director, the
+> mayor, city council or board members (flag public-works / infrastructure /
+> finance committee members), the city manager or public works director,
+> county commissioners where the utility is county-run, and the state
+> legislator(s) for the district. For EVERY person capture: full name, exact
+> title, role_category (water_director | mayor | council | city_manager |
+> public_works | finance | county_commissioner | state_legislator | other),
+> committee if any, official email, phone if listed, LinkedIn profile URL,
+> source + source URL, and confidence (high/medium/low). Every row must have
+> email and/or LinkedIn URL — a name with neither doesn't count. Sources in
+> preference order: Ballotpedia (top-100 cities), the municipality's own
+> website, Clay waterfall (treat as low-confidence until spot-checked),
+> LinkedIn Sales Navigator for verification. Write results as rows into
+> `ipi_intelligence.stakeholders_staging` (schema documented in
+> export_targets.py in the IPI Dashboard repo; stakeholder_id = new UUID,
+> municipality_key from qualified_targets, verified = FALSE,
+> hubspot_sync_status = 'pending', ipi_audience_segment = "State
+> Representative" for political roles, existing IPI operational segment for
+> water/utility staff). If BigQuery access isn't available from this
+> session, produce a CSV with exactly those columns instead and I'll load it.
 
 ## USVI caveat (verify before applying the roster template)
 

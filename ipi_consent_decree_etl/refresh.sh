@@ -32,8 +32,9 @@ python "$SCRIPT_DIR/populate_population.py" --update 2>&1 | tee -a "$LOG"
 echo "[5/7] Backfilling derived columns (signals + size tiers)..." | tee -a "$LOG"
 python "$SCRIPT_DIR/backfill_signals.py" 2>&1 | tee -a "$LOG"
 
-echo "[6/8] Scanning news for infrastructure incidents..." | tee -a "$LOG"
+echo "[6/8] Scanning news + NRC feed for infrastructure incidents..." | tee -a "$LOG"
 python "$SCRIPT_DIR/incident_monitor.py" 2>&1 | tee -a "$LOG" || true
+python "$SCRIPT_DIR/structured_incidents.py" 2>&1 | tee -a "$LOG" || true
 
 echo "[7/8] Exporting qualified target list (Layer 3a)..." | tee -a "$LOG"
 python "$SCRIPT_DIR/export_targets.py" 2>&1 | tee -a "$LOG"

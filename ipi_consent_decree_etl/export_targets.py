@@ -181,9 +181,9 @@ CREATE TABLE IF NOT EXISTS `{project}.ipi_intelligence.stakeholders_staging` (
   state STRING,
   full_name STRING NOT NULL,
   role_title STRING,                       -- e.g. "Mayor", "Council Member, District 4"
-  role_category STRING,                    -- mayor | council | city_manager |
-                                           -- public_works | finance | county_commissioner |
-                                           -- state_legislator | other
+  role_category STRING,                    -- water_director | mayor | council |
+                                           -- city_manager | public_works | finance |
+                                           -- county_commissioner | state_legislator | other
   committee STRING,                        -- public works / infrastructure / finance, if any
   email STRING,
   phone STRING,

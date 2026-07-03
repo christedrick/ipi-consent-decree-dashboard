@@ -34,3 +34,4 @@ Thumbs.db
 .idea/
 ipi_consent_decree_etl/refresh_*.log
 ipi_consent_decree_etl/qncr_cache/
+ipi_consent_decree_etl/data_cache/

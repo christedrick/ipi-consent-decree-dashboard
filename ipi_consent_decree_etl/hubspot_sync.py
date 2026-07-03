@@ -66,9 +66,9 @@ def _hs_headers():
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
-def ensure_properties(headers, dry_run: bool):
+def ensure_properties(headers, dry_run: bool, segment_values: set = None):
     """Create missing custom contact properties; extend the audience-segment
-    enumeration with the V2 value if needed."""
+    enumeration with any segment values the sync is about to write."""
     for name, (label, ptype, field) in CUSTOM_PROPERTIES.items():
         r = requests.get(f"{HS_BASE}/crm/v3/properties/contacts/{name}",
                          headers=headers, timeout=30)
@@ -89,29 +89,30 @@ def ensure_properties(headers, dry_run: bool):
             print(f"  WARNING: could not create property {name}: "
                   f"{cr.status_code} {cr.text[:200]}")
 
-    # Audience segment enumeration option
+    # Audience segment enumeration options — ensure every segment value the
+    # sync will write exists as an option (rows can carry per-role segments).
+    needed_values = {AUDIENCE_SEGMENT_VALUE} | (segment_values or set())
     r = requests.get(f"{HS_BASE}/crm/v3/properties/contacts/{AUDIENCE_SEGMENT_PROPERTY}",
                      headers=headers, timeout=30)
     if r.status_code == 200:
         prop = r.json()
         if prop.get("type") == "enumeration":
             options = {o.get("value") for o in prop.get("options", [])}
-            if AUDIENCE_SEGMENT_VALUE not in options:
+            missing = sorted(needed_values - options)
+            if missing:
                 if dry_run:
-                    print(f"  [dry-run] would add '{AUDIENCE_SEGMENT_VALUE}' option "
-                          f"to {AUDIENCE_SEGMENT_PROPERTY}")
+                    print(f"  [dry-run] would add options to "
+                          f"{AUDIENCE_SEGMENT_PROPERTY}: {missing}")
                 else:
                     new_options = prop.get("options", []) + [{
-                        "label": AUDIENCE_SEGMENT_VALUE,
-                        "value": AUDIENCE_SEGMENT_VALUE,
-                        "displayOrder": len(prop.get("options", [])),
-                    }]
+                        "label": v, "value": v,
+                        "displayOrder": len(prop.get("options", [])) + i,
+                    } for i, v in enumerate(missing)]
                     pr = requests.patch(
                         f"{HS_BASE}/crm/v3/properties/contacts/{AUDIENCE_SEGMENT_PROPERTY}",
                         headers=headers, json={"options": new_options}, timeout=30)
                     if pr.status_code == 200:
-                        print(f"  Added '{AUDIENCE_SEGMENT_VALUE}' to "
-                              f"{AUDIENCE_SEGMENT_PROPERTY} options")
+                        print(f"  Added {AUDIENCE_SEGMENT_PROPERTY} options: {missing}")
                     else:
                         print(f"  WARNING: couldn't extend {AUDIENCE_SEGMENT_PROPERTY}: "
                               f"{pr.status_code} {pr.text[:200]}")
@@ -124,6 +125,7 @@ def fetch_approved(client, project_id):
     sql = f"""
     SELECT s.stakeholder_id, s.municipality_key, s.city, s.state,
            s.full_name, s.role_title, s.role_category, s.email, s.phone,
+           s.ipi_audience_segment,
            q.best_signal_type, q.priority_score
     FROM `{project_id}.ipi_intelligence.stakeholders_staging` s
     LEFT JOIN `{project_id}.ipi_intelligence.qualified_targets` q
@@ -155,7 +157,10 @@ def sync_contacts(rows, headers, dry_run: bool):
             "jobtitle": row.role_title or "",
             "city": row.city or "",
             "state": row.state or "",
-            AUDIENCE_SEGMENT_PROPERTY: AUDIENCE_SEGMENT_VALUE,
+            # Per-row segment: political contacts default to "State
+            # Representative"; operational contacts (water/utility directors,
+            # public works) carry whatever segment 3b research set on the row.
+            AUDIENCE_SEGMENT_PROPERTY: row.ipi_audience_segment or AUDIENCE_SEGMENT_VALUE,
             "ipi_municipality_key": row.municipality_key,
             "ipi_signal_type": row.best_signal_type or "",
             "ipi_priority_score": row.priority_score,
@@ -232,7 +237,8 @@ def main():
 
     headers = _hs_headers()
     print("Ensuring HubSpot properties...")
-    ensure_properties(headers, args.dry_run)
+    segments = {r.ipi_audience_segment for r in rows if r.ipi_audience_segment}
+    ensure_properties(headers, args.dry_run, segments)
 
     print("Syncing contacts...")
     synced = sync_contacts(rows, headers, args.dry_run)
