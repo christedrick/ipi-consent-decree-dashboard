@@ -1,10 +1,39 @@
-# IPI Consent Decree ETL
+# IPI Enforcement Intelligence ETL (V2)
 
-Pulls EPA ECHO enforcement data for municipal water/wastewater consent decrees,
+Pulls EPA ECHO enforcement data for municipal water/wastewater systems,
 enriches with Census population data, and loads into Google BigQuery.
 
-Built for **IPI Pipe** to power a sales intelligence dashboard identifying
-municipalities under Clean Water Act or wastewater consent decrees.
+Built for **IPI** to power a lead-generation and stakeholder-intelligence
+system. V2 reframes the signal hierarchy: **state enforcement actions are the
+primary (leading) signal**; federal consent decrees are kept as the secondary
+signal; QNCR/DMR effluent noncompliance is a near-real-time discovery tier.
+
+## V2 signal hierarchy
+
+| Rank | signal_type | Source |
+|------|-------------|--------|
+| 1 | State Enforcement Action | NPDES formal enforcement (state-issued) |
+| 2 | Federal Consent Decree | ICIS-FE&C + NPDES (EPA/DOJ decrees, CJAs) |
+| 3 | Federal Enforcement Action | ICIS-FE&C (ACOs, penalty orders, etc.) |
+| 4 | DMR Violation | NPDES_QNCR_HISTORY (persistent effluent noncompliance, no enforcement action yet) |
+
+## V2 pipeline scripts (run order — see refresh.sh)
+
+1. `etl_bulk.py` — bulk download + signal classification + QNCR/DMR tier
+2. `seed_data.py` — hand-curated federal decree corrections
+3. `deadline_lookup.py` — real compliance deadlines from DOJ/EPA sources
+4. `populate_population.py --update` — Census population fill-in
+5. `backfill_signals.py` — derived columns: signal_type/signal_rank on seed
+   rows + `size_tier` (Small <100k / Medium 100k-500k / Large 500k+)
+6. `export_targets.py` — **Layer 3a**: rebuilds `qualified_targets`
+   (municipality-grain, priority-scored) + ensures `stakeholders_staging`
+7. `validate_data.py --fix` — data quality checks
+
+Additional (manual):
+- `hubspot_sync.py` — **Layer 5**: pushes `approved` staging rows to HubSpot
+  (needs `HUBSPOT_PRIVATE_APP_TOKEN` in .env)
+- `tune_qncr_floor.py` — one-off QNCR noise-floor analysis (caches CSVs
+  to `qncr_cache/`)
 
 ## Data Sources
 

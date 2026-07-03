@@ -26,7 +26,13 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Cloud vs local credential detection
 # ---------------------------------------------------------------------------
-_RUNNING_ON_CLOUD = os.getenv("STREAMLIT_SHARING_MODE") or hasattr(st, "secrets") and "gcp_service_account" in st.secrets
+try:
+    _RUNNING_ON_CLOUD = bool(
+        os.getenv("STREAMLIT_SHARING_MODE")
+        or (hasattr(st, "secrets") and "gcp_service_account" in st.secrets)
+    )
+except Exception:
+    _RUNNING_ON_CLOUD = False
 
 
 def _get_bigquery_client(project_id):
@@ -83,7 +89,7 @@ def _run_etl_refresh() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="IPI Pipe — Consent Decree Intelligence",
+    page_title="IPI — Enforcement & Infrastructure Intelligence",
     page_icon="🔧",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -139,6 +145,7 @@ st.markdown("""
     .badge-high { background: #66BB6A22; color: #66BB6A; border: 1px solid #66BB6A44; }
     .badge-prime { background: #00C85322; color: #00C853; border: 1px solid #00C85344; }
     .badge-unknown { background: #99999922; color: #999999; border: 1px solid #99999944; }
+    .badge-monitoring { background: #7E57C222; color: #7E57C2; border: 1px solid #7E57C244; }
 
     /* Header */
     .main-header {
@@ -168,16 +175,62 @@ st.markdown("""
 
 @st.cache_data(ttl=300)
 def load_data() -> pd.DataFrame:
-    """Load consent decree data from BigQuery."""
+    """Load enforcement data from BigQuery, ranked signal-first.
+
+    V2 signal weighting: state enforcement actions are the LEADING
+    indicator (rank 1) — state agencies act earlier in the enforcement
+    lifecycle than EPA/DOJ. Federal consent decrees stay visible as the
+    secondary signal (rank 2), other federal actions rank 3.
+    """
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
 
     client = _get_bigquery_client(project_id)
     query = """
         SELECT *
         FROM `ipi_intelligence.consent_decrees`
-        ORDER BY penalty_amount DESC
+        ORDER BY COALESCE(signal_rank, 5) ASC, penalty_amount DESC
     """
     df = client.query(query).to_dataframe()
+
+    # Fallback signal classification for rows/environments where the
+    # backfill hasn't run (derives from enforcement_level + action_type).
+    if "signal_rank" not in df.columns:
+        df["signal_rank"] = pd.NA
+        df["signal_type"] = pd.NA
+    missing = df["signal_rank"].isna()
+    if missing.any():
+        def _classify(row):
+            level = str(row.get("enforcement_level") or "").lower()
+            action = str(row.get("action_type") or "").lower()
+            if level == "state":
+                return "State Enforcement Action", 1
+            if level == "federal":
+                if any(t in action for t in (
+                    "consent decree", "consent agreement/final order",
+                    "civil judicial action",
+                )):
+                    return "Federal Consent Decree", 2
+                return "Federal Enforcement Action", 3
+            return "Unclassified", 5
+        classified = df.loc[missing].apply(_classify, axis=1)
+        df.loc[missing, "signal_type"] = classified.apply(lambda t: t[0])
+        df.loc[missing, "signal_rank"] = classified.apply(lambda t: t[1])
+    df["signal_rank"] = df["signal_rank"].astype("Int64")
+
+    # Size tier (Layer 2) — always derived fresh from population so it can
+    # never go stale vs. the materialized BigQuery column.
+    def _size_tier(pop):
+        if pd.isna(pop):
+            return "Unknown"
+        if pop < 100_000:
+            return "Small"
+        if pop < 500_000:
+            return "Medium"
+        return "Large"
+    if "population" in df.columns:
+        df["size_tier"] = df["population"].apply(_size_tier)
+    else:
+        df["size_tier"] = "Unknown"
 
     # Recalculate sales priority from live dates
     if "compliance_end_date" in df.columns:
@@ -188,6 +241,24 @@ def load_data() -> pd.DataFrame:
         df["urgency_tier"] = df.apply(
             lambda r: _sales_priority(r, today), axis=1
         )
+
+    # DMR/QNCR rows are discovery-tier monitoring signals, not enforcement
+    # actions — their recent signal dates must NOT score them as "prime"
+    # leads. They get their own tier, excluded from Prime/High KPIs.
+    df.loc[df["signal_rank"] == 4, "urgency_tier"] = "monitoring"
+
+    # Default V2 ordering: signal strength first, then sales priority
+    # recency tiers within a signal, then penalty size.
+    _tier_order = {
+        "prime": 0, "high": 1, "nearing deadline": 2, "overdue": 3,
+        "late": 4, "moderate": 5, "unknown": 6, "monitoring": 7,
+    }
+    if "urgency_tier" in df.columns:
+        df["_tier_sort"] = df["urgency_tier"].map(_tier_order).fillna(6)
+        df = df.sort_values(
+            by=["signal_rank", "_tier_sort", "penalty_amount"],
+            ascending=[True, True, False],
+        ).drop(columns="_tier_sort").reset_index(drop=True)
 
     return df
 
@@ -302,13 +373,98 @@ def format_population(val) -> str:
     return f"{int(val):,}"
 
 
+@st.cache_data(ttl=300)
+def load_qualified_targets() -> pd.DataFrame:
+    """Load the Layer 3a/4 municipality-grain target list, if exported."""
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    try:
+        return client.query("""
+            SELECT city, state, size_tier, best_signal_type,
+                   n_signals, n_state_actions, n_federal_decrees, n_dmr,
+                   latest_signal_date, total_penalties, population,
+                   priority_score, has_stakeholders
+            FROM `ipi_intelligence.qualified_targets`
+            ORDER BY priority_score DESC, total_penalties DESC
+        """).to_dataframe()
+    except Exception:
+        return pd.DataFrame()  # table not exported yet
+
+
+def render_top_targets(targets: pd.DataFrame):
+    """Render the V2 priority-scored municipality ranking (Layer 4)."""
+    st.markdown("#### Top Priority Targets — Municipality Ranking")
+    st.caption(
+        "Composite score: signal strength (state action 40 > federal decree 30 "
+        "> other federal 20 > DMR 10) + signal volume + size tier + recency "
+        "+ pipe-infrastructure flag + stakeholder reachability. "
+        "One row per qualified municipality (Medium/Large with an active signal)."
+    )
+    if targets.empty:
+        st.info(
+            "Qualified target list not exported yet — run "
+            "`python export_targets.py` in the ETL directory (or a full refresh)."
+        )
+        return
+
+    show = targets.head(25).copy()
+    st.dataframe(
+        show,
+        column_config={
+            "city": st.column_config.TextColumn("Municipality"),
+            "state": st.column_config.TextColumn("State", width="small"),
+            "size_tier": st.column_config.TextColumn("Size", width="small"),
+            "best_signal_type": st.column_config.TextColumn("Best Signal"),
+            "n_signals": st.column_config.NumberColumn("Signals", format="%d"),
+            "n_state_actions": st.column_config.NumberColumn("State", format="%d"),
+            "n_federal_decrees": st.column_config.NumberColumn("Fed CD", format="%d"),
+            "n_dmr": st.column_config.NumberColumn("DMR", format="%d"),
+            "latest_signal_date": st.column_config.DateColumn("Latest Signal", format="YYYY-MM-DD"),
+            "total_penalties": st.column_config.NumberColumn("Penalties", format="$%,.0f"),
+            "population": st.column_config.NumberColumn("Population", format="%,d"),
+            "priority_score": st.column_config.ProgressColumn(
+                "Priority Score", min_value=0, max_value=120, format="%d"
+            ),
+            "has_stakeholders": st.column_config.CheckboxColumn("Contacts"),
+        },
+        use_container_width=True,
+        height=520,
+        hide_index=True,
+    )
+    csv = targets.to_csv(index=False)
+    st.download_button(
+        label="Download full target list as CSV",
+        data=csv,
+        file_name=f"ipi_qualified_targets_{date.today().isoformat()}.csv",
+        mime="text/csv",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sidebar filters
 # ---------------------------------------------------------------------------
 
-def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
-    """Render sidebar filters and return filtered DataFrame."""
+def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
+    """Render sidebar filters.
+
+    Returns (filtered_df, size_tiers_for_ranked_list). The size-tier
+    selection is returned separately because it applies ONLY to the ranked
+    table — small municipalities stay visible on the map (deprioritized,
+    not deleted).
+    """
     st.sidebar.markdown("## Filters")
+
+    # Municipality size (Layer 2) — default Medium + Large
+    st.sidebar.markdown("### Municipality Size")
+    size_options = ["Large", "Medium", "Small", "Unknown"]
+    selected_sizes = st.sidebar.multiselect(
+        "Size Tier (ranked list only)",
+        options=size_options,
+        default=["Large", "Medium"],
+        help="Small < 100k | Medium 100k-500k | Large 500k+ (service-area "
+             "population). Applies to the ranked table; the map always shows "
+             "all sizes. 'Unknown' = no population data on record.",
+    )
 
     # Case status filter — default to Active only
     st.sidebar.markdown("### Case Status")
@@ -331,98 +487,24 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
              "(SSO, CSO, pipeline, wastewater, POTW, etc.)",
     )
 
-    # Action type filter
-    st.sidebar.markdown("### Action Type")
-    if "action_type" in df.columns:
-        action_types = sorted(df["action_type"].dropna().unique().tolist())
-    else:
-        action_types = []
-
-    # Preset buttons
-    LARGE_PROJECT_TYPES = [
-        "Consent Decree",
-        "Civil Judicial Action",
-        "State Administrative Order of Consent",
-        "State CWA Penalty AO",
-        "FDEP Consent Order",
-        "Georgia EPD Consent Order",
-        "Georgia EPD Administrative Order",
-        "Regional Water Board CAO",
-        "NJDEP Administrative Consent Order",
-        "PA DEP Consent Order",
-        "IDEM Consent Order",
-        "IDEM Agreed Order",
-        "Ohio EPA Consent Order",
-        "Ohio EPA Director's Final Findings & Orders",
-        "WV DEP Consent Order",
-        "TDEC Consent Order",
-        "ADEM Consent Order",
-        "EGLE Administrative Consent Order",
-        "TCEQ Agreed Order",
-        "MDEQ Administrative Order",
-        "PA DEP Administrative Order",
-        "State Water Board CDO",
+    # Signal type filter (V2) — supersedes the old Enforcement Level filter
+    st.sidebar.markdown("### Signal Type")
+    _signal_order = [
+        "State Enforcement Action", "Federal Consent Decree",
+        "Federal Enforcement Action", "DMR Violation", "Unclassified",
     ]
-    LEADING_INDICATOR_TYPES = [
-        "Administrative Compliance Order",
-    ]
-
-    preset_col1, preset_col2, preset_col3 = st.sidebar.columns(3)
-    with preset_col1:
-        if st.button("Large Projects", help="Consent decrees + state consent/penalty orders + civil judicial actions — confirmed enforcement programs requiring infrastructure work", use_container_width=True):
-            st.session_state["_action_type_sel"] = [t for t in LARGE_PROJECT_TYPES if t in action_types]
-    with preset_col2:
-        if st.button("Leading Indicators", help="Federal Administrative Compliance Orders — often precede consent decrees; useful for identifying early-stage opportunities", use_container_width=True):
-            st.session_state["_action_type_sel"] = [t for t in LEADING_INDICATOR_TYPES if t in action_types]
-    with preset_col3:
-        if st.button("Clear", help="Reset action type filter to show all", use_container_width=True):
-            st.session_state["_action_type_sel"] = []
-
-    selected_action_types = st.sidebar.multiselect(
-        "Action Type",
-        options=action_types,
-        key="_action_type_sel",
-        placeholder="All action types",
-        help="Consent Decree = court-ordered, long-term compliance agreement | "
-             "ACO = EPA administrative order (may escalate to consent decree) | "
-             "State AO = state-level administrative orders & penalties",
+    present_signals = (
+        df["signal_type"].dropna().unique().tolist()
+        if "signal_type" in df.columns else []
     )
-
-    # Recently Issued toggle
-    recently_issued = st.sidebar.checkbox(
-        "Recently issued only (≤ 1 year)",
-        value=False,
-        help="Show only enforcement actions issued since "
-             + (date.today() - timedelta(days=365)).strftime("%B %Y"),
-    )
-
-    # Enforcement level filter (Federal vs State)
-    st.sidebar.markdown("### Enforcement Level")
-    enf_levels = sorted(
-        df["enforcement_level"].dropna().unique().tolist()
-    ) if "enforcement_level" in df.columns else []
-    selected_levels = st.sidebar.multiselect(
-        "Enforcement Level",
-        options=enf_levels if enf_levels else ["Federal", "State", "Joint"],
+    signal_options = [s for s in _signal_order if s in present_signals] or _signal_order
+    selected_signals = st.sidebar.multiselect(
+        "Signal Type",
+        options=signal_options,
         default=[],
-        placeholder="All levels",
-        help="Federal = EPA/DOJ consent decrees | State = state agency orders",
-    )
-
-    # Date range filter
-    st.sidebar.markdown("### Date Range")
-    if "consent_decree_date" in df.columns and len(df) > 0:
-        valid_years = df["consent_decree_date"].dropna().apply(lambda d: d.year)
-        min_year = int(valid_years.min()) if len(valid_years) > 0 else 1990
-        max_year = int(valid_years.max()) if len(valid_years) > 0 else date.today().year
-    else:
-        min_year = 1990
-        max_year = date.today().year
-    year_range = st.sidebar.slider(
-        "Consent decree year range",
-        min_value=min_year,
-        max_value=max_year,
-        value=(min_year, max_year),
+        placeholder="All signals",
+        help="State actions = leading indicator | Federal consent decrees = "
+             "secondary signal | DMR Violation = monitoring-only discovery tier",
     )
 
     # State filter
@@ -434,26 +516,100 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
         placeholder="All states & territories",
     )
 
-    # Sales priority filter
-    urgency_options = ["prime", "high", "moderate", "late", "nearing deadline", "overdue", "unknown"]
-    selected_urgency = st.sidebar.multiselect(
-        "Sales Priority",
-        options=urgency_options,
-        default=[],
-        placeholder="All priorities",
-    )
+    # ---- Advanced filters (collapsed by default — V2 simplification: the
+    # signal hierarchy + size tiers + priority score replace most day-to-day
+    # use of these) ----
+    with st.sidebar.expander("Advanced filters"):
+        if "action_type" in df.columns:
+            action_types = sorted(df["action_type"].dropna().unique().tolist())
+        else:
+            action_types = []
 
-    # Penalty range
-    st.sidebar.markdown("### Penalty Amount")
-    max_penalty = int(df["penalty_amount"].max()) if len(df) > 0 else 1000000
-    penalty_range = st.sidebar.slider(
-        "Minimum penalty ($)",
-        min_value=0,
-        max_value=max_penalty,
-        value=0,
-        step=100000,
-        format="$%d",
-    )
+        LARGE_PROJECT_TYPES = [
+            "Consent Decree",
+            "Civil Judicial Action",
+            "State Administrative Order of Consent",
+            "State CWA Penalty AO",
+            "FDEP Consent Order",
+            "Georgia EPD Consent Order",
+            "Georgia EPD Administrative Order",
+            "Regional Water Board CAO",
+            "NJDEP Administrative Consent Order",
+            "PA DEP Consent Order",
+            "IDEM Consent Order",
+            "IDEM Agreed Order",
+            "Ohio EPA Consent Order",
+            "Ohio EPA Director's Final Findings & Orders",
+            "WV DEP Consent Order",
+            "TDEC Consent Order",
+            "ADEM Consent Order",
+            "EGLE Administrative Consent Order",
+            "TCEQ Agreed Order",
+            "MDEQ Administrative Order",
+            "PA DEP Administrative Order",
+            "State Water Board CDO",
+        ]
+        LEADING_INDICATOR_TYPES = [
+            "Administrative Compliance Order",
+        ]
+
+        preset_col1, preset_col2, preset_col3 = st.columns(3)
+        with preset_col1:
+            if st.button("Large Projects", help="Consent decrees + state consent/penalty orders + civil judicial actions", use_container_width=True):
+                st.session_state["_action_type_sel"] = [t for t in LARGE_PROJECT_TYPES if t in action_types]
+        with preset_col2:
+            if st.button("Leading Indicators", help="Federal ACOs — often precede consent decrees", use_container_width=True):
+                st.session_state["_action_type_sel"] = [t for t in LEADING_INDICATOR_TYPES if t in action_types]
+        with preset_col3:
+            if st.button("Clear", help="Reset action type filter", use_container_width=True):
+                st.session_state["_action_type_sel"] = []
+
+        selected_action_types = st.multiselect(
+            "Action Type",
+            options=action_types,
+            key="_action_type_sel",
+            placeholder="All action types",
+        )
+
+        recently_issued = st.checkbox(
+            "Recently issued only (≤ 1 year)",
+            value=False,
+            help="Show only enforcement actions issued since "
+                 + (date.today() - timedelta(days=365)).strftime("%B %Y"),
+        )
+
+        if "consent_decree_date" in df.columns and len(df) > 0:
+            valid_years = df["consent_decree_date"].dropna().apply(lambda d: d.year)
+            min_year = int(valid_years.min()) if len(valid_years) > 0 else 1990
+            max_year = int(valid_years.max()) if len(valid_years) > 0 else date.today().year
+        else:
+            min_year = 1990
+            max_year = date.today().year
+        year_range = st.slider(
+            "Action year range",
+            min_value=min_year,
+            max_value=max_year,
+            value=(min_year, max_year),
+        )
+
+        urgency_options = ["prime", "high", "moderate", "late",
+                           "nearing deadline", "overdue", "unknown", "monitoring"]
+        selected_urgency = st.multiselect(
+            "Sales Priority",
+            options=urgency_options,
+            default=[],
+            placeholder="All priorities",
+        )
+
+        max_penalty = int(df["penalty_amount"].max()) if len(df) > 0 else 1000000
+        penalty_range = st.slider(
+            "Minimum penalty ($)",
+            min_value=0,
+            max_value=max_penalty,
+            value=0,
+            step=100000,
+            format="$%d",
+        )
 
     # Apply filters
     filtered = df.copy()
@@ -474,8 +630,8 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
     if selected_action_types and "action_type" in filtered.columns:
         filtered = filtered[filtered["action_type"].isin(selected_action_types)]
 
-    if selected_levels and "enforcement_level" in filtered.columns:
-        filtered = filtered[filtered["enforcement_level"].isin(selected_levels)]
+    if selected_signals and "signal_type" in filtered.columns:
+        filtered = filtered[filtered["signal_type"].isin(selected_signals)]
 
     if "consent_decree_date" in filtered.columns and not recently_issued:
         filtered = filtered[
@@ -499,13 +655,13 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
 
     filtered = filtered[filtered["penalty_amount"] >= penalty_range]
 
-    # Summary in sidebar
+    # Summary in sidebar — state first (V2 primary signal)
     st.sidebar.markdown("---")
     federal_count = len(filtered[filtered.get("enforcement_level", pd.Series()) == "Federal"]) if "enforcement_level" in filtered.columns else 0
     state_count = len(filtered[filtered.get("enforcement_level", pd.Series()) == "State"]) if "enforcement_level" in filtered.columns else 0
     st.sidebar.markdown(
         f"**Showing {len(filtered)}** of {len(df)} records\n\n"
-        f"Federal: **{federal_count}** | State: **{state_count}**"
+        f"State: **{state_count}** | Federal: **{federal_count}**"
     )
 
     # --- Data Refresh (local only — ETL can't run on Streamlit Cloud) ---
@@ -534,7 +690,7 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
     # --- Data Quality ---
     _render_data_quality_badge()
 
-    return filtered
+    return filtered, selected_sizes
 
 
 def _render_data_quality_badge():
@@ -600,8 +756,8 @@ def render_kpis(df: pd.DataFrame):
     with cols[1]:
         st.markdown(f"""
         <div class="kpi-card">
-            <p class="kpi-value kpi-neutral">{federal} / {state_level}</p>
-            <p class="kpi-label">Federal / State</p>
+            <p class="kpi-value kpi-neutral"><span class="kpi-blue">{state_level}</span> / {federal}</p>
+            <p class="kpi-label">State (Primary) / Federal</p>
         </div>""", unsafe_allow_html=True)
 
     with cols[2]:
@@ -686,6 +842,11 @@ def render_sales_priority_key():
                 <span style="font-size: 0.78rem; color: #999999; font-weight: 600;">UNKNOWN</span>
                 <span style="font-size: 0.72rem; color: #999;">No date info</span>
             </span>
+            <span style="display: inline-flex; align-items: center; gap: 5px;">
+                <span style="width: 10px; height: 10px; border-radius: 50%; background: #7E57C2; display: inline-block;"></span>
+                <span style="font-size: 0.78rem; color: #7E57C2; font-weight: 600;">MONITORING</span>
+                <span style="font-size: 0.72rem; color: #999;">DMR violations only — no enforcement action yet</span>
+            </span>
         </div>
         <p style="font-size: 0.7rem; color: #777; text-align: center; margin: 8px 0 2px 0; line-height: 1.4;">
             Priority uses court-ordered deadline when available, otherwise years since issuance.
@@ -715,6 +876,7 @@ def render_map(df: pd.DataFrame):
         "nearing deadline": "#FF6B35",
         "overdue": "#FF4B4B",
         "unknown": "#999999",
+        "monitoring": "#7E57C2",
     }
     map_df["color"] = map_df["urgency_tier"].map(color_map).fillna("#999999")
     map_df["size"] = map_df["penalty_amount"].apply(
@@ -724,9 +886,11 @@ def render_map(df: pd.DataFrame):
         lambda r: (
             f"<b>{r['facility_name']}</b><br>"
             f"{r['city']}, {r['state']}<br>"
+            f"Signal: {r.get('signal_type') or '—'}<br>"
             f"Penalty: {format_currency(r['penalty_amount'])}<br>"
             f"Priority: {r['urgency_tier'].upper()}<br>"
             f"Population: {format_population(r.get('population', 0))}"
+            f" ({r.get('size_tier', 'Unknown')})"
         ),
         axis=1,
     )
@@ -734,7 +898,7 @@ def render_map(df: pd.DataFrame):
     fig = go.Figure()
 
     # Render in order: prime first (most important), then descending
-    for tier in ["prime", "high", "moderate", "late", "nearing deadline", "overdue", "unknown"]:
+    for tier in ["prime", "high", "moderate", "late", "nearing deadline", "overdue", "unknown", "monitoring"]:
         tier_df = map_df[map_df["urgency_tier"] == tier]
         if tier_df.empty:
             continue
@@ -796,12 +960,12 @@ def render_charts(df: pd.DataFrame):
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("#### Decrees by Sales Priority")
+        st.markdown("#### Actions by Sales Priority")
         urgency_counts = df["urgency_tier"].value_counts().reindex(
-            ["prime", "high", "moderate", "late", "nearing deadline", "overdue", "unknown"],
+            ["prime", "high", "moderate", "late", "nearing deadline", "overdue", "unknown", "monitoring"],
             fill_value=0,
         )
-        colors = ["#00C853", "#66BB6A", "#42A5F5", "#FFA726", "#FF6B35", "#FF4B4B", "#999999"]
+        colors = ["#00C853", "#66BB6A", "#42A5F5", "#FFA726", "#FF6B35", "#FF4B4B", "#999999", "#7E57C2"]
         fig = go.Figure(go.Bar(
             x=urgency_counts.index.str.upper(),
             y=urgency_counts.values,
@@ -854,11 +1018,20 @@ def render_charts(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 def render_table(df: pd.DataFrame):
-    """Render the detailed data table."""
+    """Render the detailed data table.
+
+    Default order is signal-first (state enforcement > federal consent
+    decree > other federal), then sales-priority recency, then penalty.
+    """
     st.markdown("#### Enforcement Action Details")
+    st.caption(
+        "Ranked signal-first: state enforcement actions lead (earlier in the "
+        "enforcement lifecycle), federal consent decrees follow as the "
+        "secondary signal."
+    )
 
     display_cols = [
-        "facility_name", "city", "state", "enforcement_level",
+        "facility_name", "city", "state", "signal_type", "size_tier",
         "case_status", "urgency_tier", "consent_decree_date",
         "compliance_end_date", "days_to_deadline", "penalty_amount",
         "lead_agency", "population", "action_type",
@@ -872,7 +1045,8 @@ def render_table(df: pd.DataFrame):
         "facility_name": st.column_config.TextColumn("Municipality / Facility", width="large"),
         "city": st.column_config.TextColumn("City"),
         "state": st.column_config.TextColumn("State", width="small"),
-        "enforcement_level": st.column_config.TextColumn("Level", width="small"),
+        "signal_type": st.column_config.TextColumn("Signal", width="medium"),
+        "size_tier": st.column_config.TextColumn("Size", width="small"),
         "case_status": st.column_config.TextColumn("Status", width="small"),
         "urgency_tier": st.column_config.TextColumn("Priority", width="small"),
         "consent_decree_date": st.column_config.DateColumn("Decree Date", format="YYYY-MM-DD"),
@@ -911,6 +1085,21 @@ def render_data_sources():
     """Render an expandable data sources and methodology section."""
     with st.expander("Data Sources & Methodology"):
         st.markdown("""
+## Signal Hierarchy (V2)
+
+Records are ranked **signal-first** in the default view:
+
+| Rank | Signal | Why |
+|------|--------|-----|
+| 1 | **State Enforcement Action** | Leading indicator — state agencies act earlier in the enforcement lifecycle. A state consent/penalty order often lands years before a federal decree, while remediation scope is still undefined. |
+| 2 | **Federal Consent Decree** | Secondary signal — confirmed, court-ordered programs. Larger but later; by decree entry, engineering contracts are often scoped. |
+| 3 | **Federal Enforcement Action** | Other federal orders (ACOs, penalty orders) — precursor signals. |
+| 4 | **DMR Violation** | Near-real-time: facilities accumulating effluent (DMR) violations in EPA's Quarterly Noncompliance Report, with no enforcement action yet. Earliest possible signal — often 1-3 years ahead of a state order. |
+
+Within each signal tier, records sort by sales-priority recency (PRIME first), then penalty.
+
+---
+
 ## Quick Start — Finding Leads
 
 This dashboard helps IPI identify municipalities under EPA/state enforcement that are likely
@@ -1067,13 +1256,14 @@ def main():
     """Main dashboard layout."""
     # Header
     st.markdown(
-        '<p class="main-header">IPI Pipe — Consent Decree Intelligence</p>',
+        '<p class="main-header">IPI — Enforcement &amp; Infrastructure Intelligence</p>',
         unsafe_allow_html=True,
     )
     st.markdown(
         '<p class="sub-header">'
-        'Sales intelligence dashboard — municipalities under CWA/SDWA consent '
-        'decrees likely to need underground pipe infrastructure services'
+        'Lead intelligence — state enforcement actions (leading indicator) '
+        'and federal consent decrees (secondary signal) for municipalities '
+        'likely to need infrastructure assessment and funding enablement'
         '</p>',
         unsafe_allow_html=True,
     )
@@ -1090,33 +1280,52 @@ def main():
         return
 
     # Sidebar filters
-    filtered = render_sidebar(df)
+    filtered, selected_sizes = render_sidebar(df)
 
     if filtered.empty:
         st.info("No records match the current filters. Try adjusting the sidebar filters.")
         return
 
+    # Size filter applies to the RANKED LIST only — the map keeps all sizes
+    # visible (small municipalities deprioritized, not deleted).
+    if selected_sizes and "size_tier" in filtered.columns:
+        ranked = filtered[filtered["size_tier"].isin(selected_sizes)]
+    else:
+        ranked = filtered
+
     # KPI cards
-    render_kpis(filtered)
+    render_kpis(ranked)
     st.markdown("")
 
-    # Map
+    # Top priority targets (Layer 4 municipality-grain ranking)
     st.markdown("---")
-    st.markdown("#### Consent Decree Map")
+    render_top_targets(load_qualified_targets())
+
+    # Map — all size tiers, independent of the ranked-list size filter
+    st.markdown("---")
+    st.markdown("#### Enforcement Map (all municipality sizes)")
     render_map(filtered)
     render_sales_priority_key()
     st.caption(
         "Map shows continental US, Alaska, Hawaii, and Caribbean territories. "
-        "Pacific territory data (GU, AS, MP) is included in the table below."
+        "Pacific territory data (GU, AS, MP) is included in the table below. "
+        "The map ignores the size-tier filter; the table below applies it."
     )
 
     # Charts
     st.markdown("---")
-    render_charts(filtered)
+    render_charts(ranked)
 
-    # Data table
+    # Data table — ranked list, size filter applied
     st.markdown("---")
-    render_table(filtered)
+    hidden = len(filtered) - len(ranked)
+    if hidden > 0:
+        st.caption(
+            f"Size filter active: {hidden:,} records outside "
+            f"{', '.join(selected_sizes)} tiers are hidden from this list "
+            "(still shown on the map)."
+        )
+    render_table(ranked)
 
     # Data sources
     st.markdown("---")

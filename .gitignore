@@ -32,3 +32,5 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+ipi_consent_decree_etl/refresh_*.log
+ipi_consent_decree_etl/qncr_cache/

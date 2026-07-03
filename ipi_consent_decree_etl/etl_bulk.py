@@ -186,10 +186,52 @@ BQ_SCHEMA = [
     ("days_to_deadline", "INT64"),
     ("urgency_tier", "STRING"),
     ("case_status", "STRING"),
+    ("signal_type", "STRING"),
+    ("signal_rank", "INT64"),
     ("latitude", "FLOAT64"),
     ("longitude", "FLOAT64"),
     ("last_updated", "TIMESTAMP"),
 ]
+
+# ---------------------------------------------------------------------------
+# Signal classification (V2) — state enforcement is the LEADING indicator.
+# State agencies act earlier in the enforcement lifecycle than EPA/DOJ;
+# by the time a federal consent decree lands, remediation contracts are
+# often already scoped. Lower rank = stronger/earlier signal.
+# ---------------------------------------------------------------------------
+
+SIGNAL_STATE_ENFORCEMENT = ("State Enforcement Action", 1)
+SIGNAL_FEDERAL_CD = ("Federal Consent Decree", 2)
+SIGNAL_FEDERAL_OTHER = ("Federal Enforcement Action", 3)
+SIGNAL_DMR_ONLY = ("DMR Violation", 4)  # QNCR effluent noncompliance tier
+SIGNAL_UNKNOWN = ("Unclassified", 5)
+
+# QNCR noise floor — tuned on real distribution (see process_qncr_dmr doc)
+QNCR_MIN_SNC_QUARTERS = 2   # SNC-flagged quarters to qualify via persistence
+QNCR_MIN_E90_WITH_SNC = 10  # effluent violations required alongside SNC
+QNCR_MIN_E90_ALONE = 40     # effluent violations that qualify on volume alone
+QNCR_RECENCY_QUARTERS = 4   # latest violation must fall in this many quarters
+
+_FEDERAL_CD_ACTION_TYPES = {
+    "consent decree", "consent agreement/final order", "civil judicial action",
+}
+
+
+def classify_signal(enforcement_level: str, action_type: str) -> tuple[str, int]:
+    """Return (signal_type, signal_rank) for a record.
+
+    Ranking: state action (1) > federal consent decree (2) > other federal (3)
+    > DMR-only (4). Matches the V2 scoring hierarchy.
+    """
+    level = (enforcement_level or "").strip().lower()
+    action = (action_type or "").strip().lower()
+    if level == "state":
+        return SIGNAL_STATE_ENFORCEMENT
+    if level == "federal":
+        if any(t in action for t in _FEDERAL_CD_ACTION_TYPES):
+            return SIGNAL_FEDERAL_CD
+        return SIGNAL_FEDERAL_OTHER
+    return SIGNAL_UNKNOWN
 
 # Concurrent Census lookups
 MAX_CENSUS_WORKERS = 10
@@ -553,6 +595,7 @@ def process_icis_fec(
 
             days = _compute_days(compliance_end)
             urgency = _compute_urgency(days)
+            signal_type, signal_rank = classify_signal(enforcement_level, action_desc)
 
             rec = {
                 "case_number": case_number,
@@ -578,6 +621,8 @@ def process_icis_fec(
                 "case_status": _map_case_status(
                     (case.get("ACTIVITY_STATUS_CODE") or "").strip().upper()
                 ),
+                "signal_type": signal_type,
+                "signal_rank": signal_rank,
                 "latitude": _parse_float(fac.get("LATITUDE") or "", default=None),
                 "longitude": _parse_float(fac.get("LONGITUDE") or "", default=None),
                 "last_updated": datetime.utcnow().isoformat(),
@@ -601,7 +646,7 @@ def process_icis_fec(
 def process_npdes(
     zip_bytes: bytes,
     cutoff_date: date,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """Process NPDES bulk data for state and federal CWA enforcement actions.
 
     Joins:
@@ -611,6 +656,10 @@ def process_npdes(
 
     This dataset includes BOTH state and federal enforcement under CWA/NPDES.
     The AGENCY field distinguishes state from EPA-led actions.
+
+    Returns (records, context) where context carries the municipal facility
+    universe so the QNCR/DMR processor can reuse it:
+        {"municipal_npdes": set, "fac_by_npdes": dict, "enforced_npdes": set}
     """
     log.info("")
     log.info("=" * 60)
@@ -621,9 +670,10 @@ def process_npdes(
     facilities = read_csv_from_zip(zip_bytes, "ICIS_FACILITIES.csv")
     sics = read_csv_from_zip(zip_bytes, "NPDES_SICS.csv")
 
+    empty_context = {"municipal_npdes": set(), "fac_by_npdes": {}, "enforced_npdes": set()}
     if not formal_actions:
         log.error("No data in NPDES_FORMAL_ENFORCEMENT_ACTIONS.csv")
-        return []
+        return [], empty_context
 
     log.info("Total NPDES formal enforcement actions: %d", len(formal_actions))
     log.info("Total ICIS facilities: %d", len(facilities))
@@ -672,6 +722,7 @@ def process_npdes(
 
     # Filter enforcement actions
     records = []
+    enforced_npdes = set()  # facilities with an enforcement record in output
     stats = {
         "municipal_matched": 0,
         "significant_matched": 0,
@@ -760,6 +811,8 @@ def process_npdes(
         ).strip()
 
         days = None  # NPDES enforcement actions don't have compliance end dates in this CSV
+        npdes_action_type = (action.get("ENF_TYPE_DESC") or enf_type_code).strip()
+        signal_type, signal_rank = classify_signal(enforcement_level, npdes_action_type)
         rec = {
             "case_number": case_number,
             "registry_id": (fac.get("FACILITY_UIN") or "").strip(),
@@ -773,7 +826,7 @@ def process_npdes(
             "compliance_end_date": None,
             "lead_agency": lead_agency,
             "enforcement_level": enforcement_level,
-            "action_type": (action.get("ENF_TYPE_DESC") or enf_type_code).strip(),
+            "action_type": npdes_action_type,
             "violation_type": "CWA",
             "penalty_amount": total_penalty,
             "statute": "CWA",
@@ -782,11 +835,14 @@ def process_npdes(
             "days_to_deadline": days,
             "urgency_tier": _compute_urgency(days),
             "case_status": _npdes_case_status(cd_date),
+            "signal_type": signal_type,
+            "signal_rank": signal_rank,
             "latitude": _parse_float(fac.get("GEOCODE_LATITUDE") or "", default=None),
             "longitude": _parse_float(fac.get("GEOCODE_LONGITUDE") or "", default=None),
             "last_updated": datetime.utcnow().isoformat(),
         }
         records.append(rec)
+        enforced_npdes.add(npdes_id)
 
     log.info("")
     log.info("NPDES results:")
@@ -797,6 +853,178 @@ def process_npdes(
     log.info("  Pipe infrastructure flagged: %d", stats["pipe_flagged"])
     log.info("  Records produced: %d", len(records))
 
+    context = {
+        "municipal_npdes": municipal_npdes,
+        "fac_by_npdes": fac_by_npdes,
+        "enforced_npdes": enforced_npdes,
+    }
+    return records, context
+
+
+# ---------------------------------------------------------------------------
+# QNCR / DMR processing — effluent noncompliance as a near-real-time signal
+# ---------------------------------------------------------------------------
+
+def process_qncr_dmr(
+    zip_bytes: bytes,
+    context: dict,
+    quarters_back: int = 8,
+) -> list[dict]:
+    """Process NPDES_QNCR_HISTORY.csv (same npdes_downloads.zip — no extra
+    download) for recent effluent/DMR noncompliance at municipal facilities.
+
+    The QNCR aggregates Discharge Monitoring Report violations per
+    facility-quarter:
+        NUME90Q — count of effluent (E90) violations in the quarter
+        HLRNC   — highest level of noncompliance (SNC codes, blank = none)
+
+    This is the V2 "near-real-time incident" tier: a facility racking up
+    effluent violations NOW is often 1-3 years ahead of a state order and
+    3-5+ ahead of a federal decree. Only facilities WITHOUT an existing
+    enforcement record are emitted (rank-4 signal, weakest tier) — if a
+    facility already has an enforcement action, that stronger signal wins.
+
+    Noise floor (tuned on the real July 2026 distribution — 30,355 municipal
+    facilities showed some noncompliance in an 8-quarter window; the floor
+    below keeps ~3-5k persistent/substantial violators):
+      - persistent AND substantial: >= QNCR_MIN_SNC_QUARTERS SNC quarters
+        AND >= QNCR_MIN_E90_WITH_SNC effluent violations, OR
+      - egregious volume alone: >= QNCR_MIN_E90_ALONE effluent violations
+      - AND recent: latest violating quarter within QNCR_RECENCY_QUARTERS
+    """
+    log.info("")
+    log.info("=" * 60)
+    log.info("PROCESSING QNCR (DMR / Effluent Noncompliance)")
+    log.info("=" * 60)
+
+    municipal_npdes = context.get("municipal_npdes", set())
+    fac_by_npdes = context.get("fac_by_npdes", {})
+    enforced_npdes = context.get("enforced_npdes", set())
+
+    if not municipal_npdes:
+        log.warning("No municipal facility universe — skipping QNCR processing")
+        return []
+
+    qncr_rows = read_csv_from_zip(zip_bytes, "NPDES_QNCR_HISTORY.csv")
+    if not qncr_rows:
+        log.warning("No data in NPDES_QNCR_HISTORY.csv — skipping DMR signal")
+        return []
+
+    # Lookback window in YEARQTR form (e.g. 20241 = Q1 2024)
+    today = date.today()
+    cur_q = (today.month - 1) // 3 + 1
+    cutoff_yearqtr = None
+    y, q = today.year, cur_q
+    for _ in range(quarters_back):
+        q -= 1
+        if q == 0:
+            y, q = y - 1, 4
+    cutoff_yearqtr = y * 10 + q
+    log.info("QNCR lookback: %d quarters (cutoff YEARQTR %d)", quarters_back, cutoff_yearqtr)
+
+    # Aggregate violations per municipal facility within the window
+    agg = {}  # npdes_id -> {"e90": int, "snc_q": int, "quarters": set, "latest": int}
+    for row in qncr_rows:
+        npdes_id = (row.get("NPDES_ID") or "").strip()
+        if npdes_id not in municipal_npdes or npdes_id in enforced_npdes:
+            continue
+        try:
+            yearqtr = int((row.get("YEARQTR") or "0").strip())
+        except ValueError:
+            continue
+        if yearqtr < cutoff_yearqtr:
+            continue
+
+        e90 = int(_parse_float(row.get("NUME90Q") or "0"))
+        hlrnc = (row.get("HLRNC") or "").strip().upper()
+        # SNC codes: S/T/X/D = significant noncompliance variants; blank/N = none
+        is_snc = hlrnc in {"S", "T", "X", "D", "E", "U", "V"}
+
+        if e90 <= 0 and not is_snc:
+            continue
+
+        a = agg.setdefault(npdes_id, {"e90": 0, "snc_q": 0, "quarters": set(), "latest": 0})
+        a["e90"] += e90
+        a["snc_q"] += 1 if is_snc else 0
+        a["quarters"].add(yearqtr)
+        a["latest"] = max(a["latest"], yearqtr)
+
+    log.info("Municipal facilities with QNCR noncompliance in window: %d", len(agg))
+
+    # Recency cutoff: latest violating quarter must be within N quarters
+    ry, rq = today.year, cur_q
+    for _ in range(QNCR_RECENCY_QUARTERS):
+        rq -= 1
+        if rq == 0:
+            ry, rq = ry - 1, 4
+    recency_yearqtr = ry * 10 + rq
+
+    # Noise floor + record build
+    records = []
+    floor_stats = {"stale": 0, "below_floor": 0}
+    for npdes_id, a in agg.items():
+        persistent = (a["snc_q"] >= QNCR_MIN_SNC_QUARTERS
+                      and a["e90"] >= QNCR_MIN_E90_WITH_SNC)
+        egregious = a["e90"] >= QNCR_MIN_E90_ALONE
+        if not (persistent or egregious):
+            floor_stats["below_floor"] += 1
+            continue
+        if a["latest"] < recency_yearqtr:
+            floor_stats["stale"] += 1
+            continue
+
+        fac = fac_by_npdes.get(npdes_id, {})
+        fac_name = (fac.get("FACILITY_NAME") or "").strip()
+        if not fac_name:
+            continue
+
+        # Approximate signal date: end of the latest violating quarter
+        latest_y, latest_q = a["latest"] // 10, a["latest"] % 10
+        q_end_month = latest_q * 3
+        signal_date = date(latest_y, q_end_month, 1).strftime("%Y-%m-%d")
+
+        pipe_flag = any(
+            kw in fac_name.lower() for kw in PIPE_INFRASTRUCTURE_KEYWORDS
+        )
+
+        violation_desc = (
+            f"{a['e90']} effluent (DMR) violations across "
+            f"{len(a['quarters'])} of last {quarters_back} quarters"
+            + (f"; SNC in {a['snc_q']} quarter(s)" if a["snc_q"] else "")
+        )
+
+        records.append({
+            "case_number": f"QNCR-{npdes_id}",
+            "registry_id": (fac.get("FACILITY_UIN") or "").strip(),
+            "fips_code": "",
+            "facility_name": fac_name,
+            "city": (fac.get("CITY") or "").strip(),
+            "state": (fac.get("STATE_CODE") or "").strip().upper(),
+            "zip_code": (fac.get("ZIP") or "").strip(),
+            "county": "",
+            "consent_decree_date": signal_date,
+            "compliance_end_date": None,
+            "lead_agency": "EPA QNCR (monitoring)",
+            "enforcement_level": "Monitoring",
+            "action_type": "Effluent/DMR Noncompliance (QNCR)",
+            "violation_type": violation_desc,
+            "penalty_amount": 0.0,
+            "statute": "CWA",
+            "pipe_infrastructure_flag": pipe_flag,
+            "population": None,
+            "days_to_deadline": None,
+            "urgency_tier": "unknown",
+            "case_status": "Active",
+            "signal_type": SIGNAL_DMR_ONLY[0],
+            "signal_rank": SIGNAL_DMR_ONLY[1],
+            "latitude": _parse_float(fac.get("GEOCODE_LATITUDE") or "", default=None),
+            "longitude": _parse_float(fac.get("GEOCODE_LONGITUDE") or "", default=None),
+            "last_updated": datetime.utcnow().isoformat(),
+        })
+
+    log.info("QNCR floor: %d below floor, %d stale (no violation in last %d qtrs)",
+             floor_stats["below_floor"], floor_stats["stale"], QNCR_RECENCY_QUARTERS)
+    log.info("QNCR records produced (post noise-floor): %d", len(records))
     return records
 
 
@@ -1376,11 +1604,17 @@ def run_bulk_etl(dry_run: bool = False, years_back: int = MAX_YEARS_BACK, skip_n
         log.error("Failed to process ICIS-FE&C: %s", e)
 
     # --- Phase 2: NPDES (State + Federal CWA enforcement) ---
+    # --- Phase 2b: QNCR/DMR effluent noncompliance (same zip) ---
     if not skip_npdes:
         try:
             npdes_zip = download_zip(NPDES_DOWNLOADS_URL, "NPDES (npdes_downloads.zip)")
-            npdes_records = process_npdes(npdes_zip, cutoff_date)
+            npdes_records, npdes_context = process_npdes(npdes_zip, cutoff_date)
             all_records.extend(npdes_records)
+            try:
+                qncr_records = process_qncr_dmr(npdes_zip, npdes_context)
+                all_records.extend(qncr_records)
+            except Exception as e:
+                log.error("Failed to process QNCR/DMR: %s", e)
             del npdes_zip
         except Exception as e:
             log.error("Failed to process NPDES: %s", e)
