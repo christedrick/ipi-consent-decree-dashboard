@@ -446,12 +446,30 @@ def load_research_queue() -> pd.DataFrame:
     client = _get_bigquery_client(project_id)
     try:
         return client.query("""
-            SELECT city, state, priority_score, status, queued_at
+            SELECT municipality_key, city, state, priority_score, status, queued_at
             FROM `ipi_intelligence.research_queue`
             ORDER BY status, priority_score DESC
         """).to_dataframe()
     except Exception:
         return pd.DataFrame()
+
+
+def remove_from_queue(keys: list) -> int:
+    """Delete municipalities from the research queue by key."""
+    if not keys:
+        return 0
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    from google.cloud import bigquery as bq
+    job = client.query(
+        "DELETE FROM `ipi_intelligence.research_queue` "
+        "WHERE municipality_key IN UNNEST(@keys)",
+        job_config=bq.QueryJobConfig(query_parameters=[
+            bq.ArrayQueryParameter("keys", "STRING", [str(k) for k in keys]),
+        ]),
+    )
+    job.result()
+    return job.num_dml_affected_rows or 0
 
 
 COWORK_QUEUE_PROMPT = """\
@@ -613,8 +631,10 @@ def render_top_targets(targets: pd.DataFrame):
         expanded=False,
     ):
         if not queue.empty:
-            st.dataframe(
+            st.caption("Tick queue rows and click Remove to take them off the list.")
+            queue_event = st.dataframe(
                 queue,
+                column_order=["city", "state", "priority_score", "status", "queued_at"],
                 column_config={
                     "city": st.column_config.TextColumn("Municipality"),
                     "state": st.column_config.TextColumn("State", width="small"),
@@ -625,7 +645,35 @@ def render_top_targets(targets: pd.DataFrame):
                 use_container_width=True,
                 height=220,
                 hide_index=True,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key="queue_table",
             )
+            q_selected = (queue_event.selection.rows
+                          if queue_event and queue_event.selection else [])
+            rm_col, clear_col = st.columns(2)
+            with rm_col:
+                if st.button(
+                    f"Remove {len(q_selected)} selected from queue",
+                    disabled=not q_selected,
+                ):
+                    picked = queue.iloc[q_selected]
+                    try:
+                        n = remove_from_queue(picked["municipality_key"].tolist())
+                        load_research_queue.clear()
+                        st.success(f"Removed {n} from queue")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Couldn't remove: {exc}")
+            with clear_col:
+                if st.button("Clear entire queue"):
+                    try:
+                        n = remove_from_queue(queue["municipality_key"].tolist())
+                        load_research_queue.clear()
+                        st.success(f"Removed {n} from queue")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Couldn't clear: {exc}")
         st.markdown("**Paste this into Cowork to run the research:**")
         st.code(COWORK_QUEUE_PROMPT, language=None)
 
