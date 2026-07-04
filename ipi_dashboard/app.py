@@ -380,7 +380,7 @@ def load_qualified_targets() -> pd.DataFrame:
     client = _get_bigquery_client(project_id)
     try:
         return client.query("""
-            SELECT city, state, size_tier, best_signal_type,
+            SELECT municipality_key, city, state, size_tier, best_signal_type,
                    n_signals, n_state_actions, n_federal_decrees, n_dmr,
                    n_recent_incidents,
                    latest_signal_date, total_penalties, population,
@@ -390,6 +390,89 @@ def load_qualified_targets() -> pd.DataFrame:
         """).to_dataframe()
     except Exception:
         return pd.DataFrame()  # table not exported yet
+
+
+RESEARCH_QUEUE_DDL = """
+CREATE TABLE IF NOT EXISTS `ipi_intelligence.research_queue` (
+  municipality_key STRING NOT NULL,
+  city STRING,
+  state STRING,
+  priority_score INT64,
+  status STRING,          -- queued | researching | done
+  queued_at TIMESTAMP
+)
+"""
+
+
+def queue_for_research(selected: pd.DataFrame) -> int:
+    """Write selected municipalities into the contact-research queue.
+    Re-queueing an existing municipality resets it to 'queued'."""
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    client.query(RESEARCH_QUEUE_DDL).result()
+
+    def esc(s):
+        return str(s or "").replace("\\", "\\\\").replace("'", "\\'")
+
+    values = ", ".join(
+        f"('{esc(r.municipality_key)}', '{esc(r.city)}', '{esc(r.state)}', "
+        f"{int(r.priority_score)})"
+        for r in selected.itertuples()
+    )
+    merge_sql = f"""
+    MERGE `ipi_intelligence.research_queue` T
+    USING (
+      SELECT * FROM UNNEST(ARRAY<STRUCT<
+        municipality_key STRING, city STRING, state STRING, priority_score INT64
+      >>[{values}])
+    ) S
+    ON T.municipality_key = S.municipality_key
+    WHEN MATCHED THEN UPDATE SET
+      status = 'queued', queued_at = CURRENT_TIMESTAMP(),
+      priority_score = S.priority_score
+    WHEN NOT MATCHED THEN INSERT
+      (municipality_key, city, state, priority_score, status, queued_at)
+      VALUES (S.municipality_key, S.city, S.state, S.priority_score,
+              'queued', CURRENT_TIMESTAMP())
+    """
+    job = client.query(merge_sql)
+    job.result()
+    return job.num_dml_affected_rows or 0
+
+
+@st.cache_data(ttl=60)
+def load_research_queue() -> pd.DataFrame:
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    try:
+        return client.query("""
+            SELECT city, state, priority_score, status, queued_at
+            FROM `ipi_intelligence.research_queue`
+            ORDER BY status, priority_score DESC
+        """).to_dataframe()
+    except Exception:
+        return pd.DataFrame()
+
+
+COWORK_QUEUE_PROMPT = """\
+Research municipal contacts for IPI. Read the queue:
+  SELECT * FROM `ipi-consent-decree-dashboard.ipi_intelligence.research_queue`
+  WHERE status = 'queued' ORDER BY priority_score DESC
+For each municipality find: water/utility director, mayor, city council or
+board members (flag public-works/infrastructure/finance committees), city
+manager or public works director, county commissioners if the utility is
+county-run, and the district's state legislator(s). Every contact row needs
+email and/or LinkedIn profile URL (email -> HubSpot Sequence, LinkedIn ->
+HeyReach); a name with neither doesn't count. Sources in order: Ballotpedia,
+the municipal website, Clay waterfall (low-confidence until spot-checked),
+LinkedIn Sales Navigator to verify. Write rows to
+`ipi_intelligence.stakeholders_staging` (stakeholder_id = new UUID,
+municipality_key from the queue row, verified = FALSE, hubspot_sync_status =
+'pending', ipi_audience_segment = 'State Representative' for political roles,
+IPI's operational segment for water/utility staff). When a municipality is
+fully researched, set its research_queue.status = 'done'. Full brief:
+ipi_consent_decree_etl/LAYER3B_HANDOFF.md in the IPI Dashboard repo.\
+"""
 
 
 @st.cache_data(ttl=300)
@@ -459,9 +542,19 @@ def render_top_targets(targets: pd.DataFrame):
         )
         return
 
-    show = targets.head(25).copy()
-    st.dataframe(
-        show,
+    st.caption(
+        "Tick rows, then click **Queue for contact research** — queued "
+        "municipalities flow to the Cowork research run (prompt below), and "
+        "researched contacts land in HubSpot after review."
+    )
+    event = st.dataframe(
+        targets,
+        column_order=[
+            "city", "state", "size_tier", "best_signal_type", "n_signals",
+            "n_state_actions", "n_federal_decrees", "n_dmr",
+            "n_recent_incidents", "latest_signal_date", "total_penalties",
+            "population", "priority_score", "has_stakeholders",
+        ],
         column_config={
             "city": st.column_config.TextColumn("Municipality"),
             "state": st.column_config.TextColumn("State", width="small"),
@@ -483,14 +576,58 @@ def render_top_targets(targets: pd.DataFrame):
         use_container_width=True,
         height=520,
         hide_index=True,
+        on_select="rerun",
+        selection_mode="multi-row",
+        key="targets_table",
     )
-    csv = targets.to_csv(index=False)
-    st.download_button(
-        label="Download full target list as CSV",
-        data=csv,
-        file_name=f"ipi_qualified_targets_{date.today().isoformat()}.csv",
-        mime="text/csv",
-    )
+
+    selected_rows = event.selection.rows if event and event.selection else []
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        if st.button(
+            f"Queue {len(selected_rows)} selected for contact research",
+            disabled=not selected_rows,
+            type="primary",
+        ):
+            picked = targets.iloc[selected_rows]
+            try:
+                queue_for_research(picked)
+                load_research_queue.clear()
+                st.success(
+                    f"Queued: {', '.join(picked['city'].fillna('?').tolist())}"
+                )
+            except Exception as exc:
+                st.error(f"Couldn't write to research queue: {exc}")
+    with col_b:
+        csv = targets.drop(columns=["municipality_key"]).to_csv(index=False)
+        st.download_button(
+            label="Download full target list as CSV",
+            data=csv,
+            file_name=f"ipi_qualified_targets_{date.today().isoformat()}.csv",
+            mime="text/csv",
+        )
+
+    queue = load_research_queue()
+    with st.expander(
+        f"Contact research queue ({len(queue)} municipalities) + Cowork prompt",
+        expanded=False,
+    ):
+        if not queue.empty:
+            st.dataframe(
+                queue,
+                column_config={
+                    "city": st.column_config.TextColumn("Municipality"),
+                    "state": st.column_config.TextColumn("State", width="small"),
+                    "priority_score": st.column_config.NumberColumn("Score", format="%d"),
+                    "status": st.column_config.TextColumn("Status", width="small"),
+                    "queued_at": st.column_config.DatetimeColumn("Queued", format="MMM DD, HH:mm"),
+                },
+                use_container_width=True,
+                height=220,
+                hide_index=True,
+            )
+        st.markdown("**Paste this into Cowork to run the research:**")
+        st.code(COWORK_QUEUE_PROMPT, language=None)
 
 
 # ---------------------------------------------------------------------------

@@ -77,7 +77,16 @@ Write one row per person. Schema highlights (full DDL in export_targets.py):
   then hubspot_sync.py pushes to HubSpot with
   ipi_audience_segment = "State Representative"
 
-## Paste-ready Cowork prompt (Texas pilot)
+## Preferred flow: the dashboard research queue
+
+The Top Priority Targets table on the dashboard supports row selection —
+tick municipalities, click **Queue for contact research**, and they land in
+`ipi_intelligence.research_queue` with status 'queued'. The dashboard shows
+a paste-ready Cowork prompt that processes the queue and flips each
+municipality to 'done' as research completes. Use the batch prompt below
+only when you want a whole-state sweep instead of hand-picked targets.
+
+## Paste-ready Cowork prompt (Texas pilot batch)
 
 > I'm doing stakeholder research for IPI (Impact Pipe Inspection —
 > infrastructure-intelligence positioning, see ipi-pipe.com). Input: the
