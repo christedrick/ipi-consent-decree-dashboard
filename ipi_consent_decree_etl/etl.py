@@ -35,6 +35,7 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+load_dotenv(os.path.expanduser("~/.config/ipi-etl/.env"))  # secrets live outside the synced repo dir
 
 # ---------------------------------------------------------------------------
 # Constants

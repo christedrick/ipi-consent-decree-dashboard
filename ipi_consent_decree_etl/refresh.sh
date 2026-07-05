@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$SCRIPT_DIR/venv/bin/activate"
 LOG="$SCRIPT_DIR/refresh_$(date +%Y%m%d_%H%M%S).log"
 
-export GOOGLE_APPLICATION_CREDENTIALS="$SCRIPT_DIR/service-account.json"
+export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/ipi-etl/service-account.json"
 
 echo "=== IPI ETL Refresh started at $(date) ===" | tee "$LOG"
 

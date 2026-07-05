@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$SCRIPT_DIR/logs/daily_incidents.log"
 mkdir -p "$SCRIPT_DIR/logs"
 
-export GOOGLE_APPLICATION_CREDENTIALS="$SCRIPT_DIR/service-account.json"
+export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/ipi-etl/service-account.json"
 PY="$SCRIPT_DIR/venv/bin/python"
 
 {

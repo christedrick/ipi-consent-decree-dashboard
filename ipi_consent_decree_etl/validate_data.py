@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from google.cloud import bigquery
 
 load_dotenv()
+load_dotenv(os.path.expanduser("~/.config/ipi-etl/.env"))  # secrets live outside the synced repo dir
 
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
 TABLE = f"`{PROJECT_ID}.ipi_intelligence.consent_decrees`"

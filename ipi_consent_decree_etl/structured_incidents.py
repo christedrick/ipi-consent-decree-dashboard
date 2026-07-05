@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 from google.cloud import bigquery
 
 load_dotenv()
+load_dotenv(os.path.expanduser("~/.config/ipi-etl/.env"))  # secrets live outside the synced repo dir
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "data_cache")
 NRC_URL_TEMPLATE = "https://nrc.uscg.mil/FOIAFiles/CY{yy}.xlsx"

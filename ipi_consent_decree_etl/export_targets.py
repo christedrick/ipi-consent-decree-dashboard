@@ -49,6 +49,7 @@ from dotenv import load_dotenv
 from google.cloud import bigquery
 
 load_dotenv()
+load_dotenv(os.path.expanduser("~/.config/ipi-etl/.env"))  # secrets live outside the synced repo dir
 
 
 QUALIFIED_TARGETS_SQL = """

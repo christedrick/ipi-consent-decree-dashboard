@@ -173,21 +173,35 @@ st.markdown("""
 # Data loading
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
-def load_data() -> pd.DataFrame:
+@st.cache_data(ttl=3600)
+def load_data(include_history: bool = False) -> pd.DataFrame:
     """Load enforcement data from BigQuery, ranked signal-first.
 
     V2 signal weighting: state enforcement actions are the LEADING
     indicator (rank 1) — state agencies act earlier in the enforcement
     lifecycle than EPA/DOJ. Federal consent decrees stay visible as the
     secondary signal (rank 2), other federal actions rank 3.
+
+    By default closed/likely-closed records stay in BigQuery (roughly
+    12k of 27k rows) — they're historical context, not leads. The
+    sidebar toggle sets include_history=True to pull everything.
     """
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
 
     client = _get_bigquery_client(project_id)
-    query = """
-        SELECT *
+    history_clause = (
+        "" if include_history
+        else "WHERE COALESCE(case_status, 'Unknown') NOT IN ('Closed', 'Likely Closed')"
+    )
+    query = f"""
+        SELECT case_number, facility_name, city, state, zip_code, county,
+               consent_decree_date, compliance_end_date, lead_agency,
+               enforcement_level, action_type, violation_type,
+               penalty_amount, statute, pipe_infrastructure_flag,
+               population, case_status, signal_type, signal_rank,
+               latitude, longitude
         FROM `ipi_intelligence.consent_decrees`
+        {history_clause}
         ORDER BY COALESCE(signal_rank, 5) ASC, penalty_amount DESC
     """
     df = client.query(query).to_dataframe()
@@ -232,15 +246,10 @@ def load_data() -> pd.DataFrame:
     else:
         df["size_tier"] = "Unknown"
 
-    # Recalculate sales priority from live dates
+    # Recalculate lifecycle stage from live dates (vectorized — same logic
+    # as _sales_priority, ~100x faster than row-wise apply at this scale)
     if "compliance_end_date" in df.columns:
-        today = date.today()
-        df["days_to_deadline"] = df["compliance_end_date"].apply(
-            lambda d: (d - today).days if pd.notna(d) else None
-        )
-        df["urgency_tier"] = df.apply(
-            lambda r: _sales_priority(r, today), axis=1
-        )
+        df = _compute_lifecycle_stages(df)
 
     # DMR/QNCR rows are discovery-tier monitoring signals, not enforcement
     # actions — their recent signal dates must NOT score them as "prime"
@@ -260,6 +269,38 @@ def load_data() -> pd.DataFrame:
             ascending=[True, True, False],
         ).drop(columns="_tier_sort").reset_index(drop=True)
 
+    return df
+
+
+def _compute_lifecycle_stages(df: pd.DataFrame) -> pd.DataFrame:
+    """Vectorized lifecycle-stage computation (see _sales_priority for the
+    reference row-wise logic and tier rationale; the two must stay in sync —
+    a parity test in the repo compares them)."""
+    import numpy as np
+
+    today = pd.Timestamp(date.today())
+    end = pd.to_datetime(df["compliance_end_date"], errors="coerce")
+    start = pd.to_datetime(df["consent_decree_date"], errors="coerce")
+
+    # "Real" deadline: end exists AND (no start, or end is >1yr after start)
+    has_deadline = end.notna() & (start.isna() | ((end - start).dt.days > 365))
+    days_left = (end - today).dt.days.where(has_deadline)
+    years_ago = (today - start).dt.days / 365.25
+
+    df["days_to_deadline"] = (end - today).dt.days.astype("Int64")
+
+    conditions = [
+        days_left < 0,                                   # overdue
+        days_left < 365,                                 # nearing deadline
+        years_ago <= 1,                                  # prime
+        (years_ago <= 2) | (days_left > 3650),           # high
+        days_left <= 1825,                               # late
+        (years_ago <= 5) | (days_left > 1825),           # moderate
+        years_ago.notna(),                               # late (old, no deadline)
+    ]
+    choices = ["overdue", "nearing deadline", "prime", "high",
+               "late", "moderate", "late"]
+    df["urgency_tier"] = np.select(conditions, choices, default="unknown")
     return df
 
 
@@ -373,21 +414,57 @@ def format_population(val) -> str:
     return f"{int(val):,}"
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def load_qualified_targets() -> pd.DataFrame:
-    """Load the Layer 3a/4 municipality-grain target list, if exported."""
+    """Load the Layer 3a/4 municipality-grain target list, if exported.
+
+    Rebuilt daily at 7:30am by the export job; queue/review actions in the
+    app explicitly clear this cache, so a long TTL is safe."""
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
     client = _get_bigquery_client(project_id)
     try:
-        return client.query("""
-            SELECT municipality_key, city, state, size_tier, best_signal_type,
-                   n_signals, n_state_actions, n_federal_decrees, n_dmr,
-                   n_recent_incidents,
-                   latest_signal_date, total_penalties, population,
-                   priority_score, has_stakeholders
-            FROM `ipi_intelligence.qualified_targets`
+        df = client.query("""
+            SELECT q.municipality_key, q.city, q.state, q.size_tier,
+                   q.best_signal_type, q.n_signals, q.n_state_actions,
+                   q.n_federal_decrees, q.n_dmr, q.n_recent_incidents,
+                   q.latest_signal_date, q.total_penalties, q.population,
+                   q.priority_score, q.has_stakeholders,
+                   rq.status AS queue_status,
+                   COALESCE(s.n_pending, 0)  AS n_pending,
+                   COALESCE(s.n_approved, 0) AS n_approved,
+                   COALESCE(s.n_synced, 0)   AS n_synced
+            FROM `ipi_intelligence.qualified_targets` q
+            LEFT JOIN `ipi_intelligence.research_queue` rq
+              USING (municipality_key)
+            LEFT JOIN (
+              SELECT municipality_key,
+                     COUNTIF(hubspot_sync_status = 'pending')  AS n_pending,
+                     COUNTIF(hubspot_sync_status = 'approved') AS n_approved,
+                     COUNTIF(hubspot_sync_status = 'synced')   AS n_synced
+              FROM `ipi_intelligence.stakeholders_staging`
+              GROUP BY municipality_key
+            ) s USING (municipality_key)
             ORDER BY priority_score DESC, total_penalties DESC
         """).to_dataframe()
+
+        # One human-readable pipeline stage per municipality, most
+        # actionable state wins.
+        def _pipeline_status(r):
+            if r.n_pending > 0:
+                return "Review contacts"
+            if r.n_approved > 0:
+                return "Ready to sync"
+            if r.n_synced > 0:
+                return "In HubSpot"
+            if r.queue_status == "researching":
+                return "Researching"
+            if r.queue_status == "queued":
+                return "Queued"
+            if r.queue_status == "done":
+                return "Researched"
+            return "—"
+        df["pipeline_status"] = df.apply(_pipeline_status, axis=1)
+        return df
     except Exception:
         return pd.DataFrame()  # table not exported yet
 
@@ -406,26 +483,26 @@ CREATE TABLE IF NOT EXISTS `ipi_intelligence.research_queue` (
 
 def queue_for_research(selected: pd.DataFrame) -> int:
     """Write selected municipalities into the contact-research queue.
-    Re-queueing an existing municipality resets it to 'queued'."""
+    Re-queueing an existing municipality resets it to 'queued'.
+    Fully parameterized — no SQL built from strings."""
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
     client = _get_bigquery_client(project_id)
     client.query(RESEARCH_QUEUE_DDL).result()
 
-    def esc(s):
-        return str(s or "").replace("\\", "\\\\").replace("'", "\\'")
-
-    values = ", ".join(
-        f"('{esc(r.municipality_key)}', '{esc(r.city)}', '{esc(r.state)}', "
-        f"{int(r.priority_score)})"
+    from google.cloud import bigquery as bq
+    row_params = [
+        bq.StructQueryParameter(
+            None,
+            bq.ScalarQueryParameter("municipality_key", "STRING", str(r.municipality_key)),
+            bq.ScalarQueryParameter("city", "STRING", str(r.city or "")),
+            bq.ScalarQueryParameter("state", "STRING", str(r.state or "")),
+            bq.ScalarQueryParameter("priority_score", "INT64", int(r.priority_score)),
+        )
         for r in selected.itertuples()
-    )
-    merge_sql = f"""
+    ]
+    merge_sql = """
     MERGE `ipi_intelligence.research_queue` T
-    USING (
-      SELECT * FROM UNNEST(ARRAY<STRUCT<
-        municipality_key STRING, city STRING, state STRING, priority_score INT64
-      >>[{values}])
-    ) S
+    USING (SELECT * FROM UNNEST(@rows)) S
     ON T.municipality_key = S.municipality_key
     WHEN MATCHED THEN UPDATE SET
       status = 'queued', queued_at = CURRENT_TIMESTAMP(),
@@ -435,7 +512,12 @@ def queue_for_research(selected: pd.DataFrame) -> int:
       VALUES (S.municipality_key, S.city, S.state, S.priority_score,
               'queued', CURRENT_TIMESTAMP())
     """
-    job = client.query(merge_sql)
+    job = client.query(
+        merge_sql,
+        job_config=bq.QueryJobConfig(query_parameters=[
+            bq.ArrayQueryParameter("rows", "STRUCT", row_params),
+        ]),
+    )
     job.result()
     return job.num_dml_affected_rows or 0
 
@@ -493,9 +575,159 @@ ipi_consent_decree_etl/LAYER3B_HANDOFF.md in the IPI Dashboard repo.\
 """
 
 
-@st.cache_data(ttl=300)
+# ---------------------------------------------------------------------------
+# Contact review — approve/reject researched stakeholders (the quality gate
+# between Cowork research output and HubSpot)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60)
+def load_pending_stakeholders() -> pd.DataFrame:
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    try:
+        return client.query("""
+            SELECT stakeholder_id, city, state, full_name, role_title,
+                   role_category, committee, email, phone, linkedin_url,
+                   source, source_url, confidence
+            FROM `ipi_intelligence.stakeholders_staging`
+            WHERE hubspot_sync_status = 'pending'
+            ORDER BY state, city, role_category
+        """).to_dataframe()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=120)
+def load_stakeholder_counts() -> dict:
+    """Pipeline totals for the review section header."""
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    try:
+        row = list(client.query("""
+            SELECT
+              COUNTIF(hubspot_sync_status = 'pending')  AS pending,
+              COUNTIF(hubspot_sync_status = 'approved') AS approved,
+              COUNTIF(hubspot_sync_status = 'synced')   AS synced,
+              COUNTIF(hubspot_sync_status = 'rejected') AS rejected
+            FROM `ipi_intelligence.stakeholders_staging`
+        """).result())[0]
+        return {"pending": row.pending, "approved": row.approved,
+                "synced": row.synced, "rejected": row.rejected}
+    except Exception:
+        return {"pending": 0, "approved": 0, "synced": 0, "rejected": 0}
+
+
+def apply_review_decisions(approve_ids: list, reject_ids: list) -> int:
+    """Write review decisions back to staging (parameterized)."""
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    from google.cloud import bigquery as bq
+    total = 0
+    for ids, status, verified in (
+        (approve_ids, "approved", True),
+        (reject_ids, "rejected", False),
+    ):
+        if not ids:
+            continue
+        job = client.query(
+            """
+            UPDATE `ipi_intelligence.stakeholders_staging`
+            SET hubspot_sync_status = @status,
+                verified = @verified,
+                updated_at = CURRENT_TIMESTAMP()
+            WHERE stakeholder_id IN UNNEST(@ids)
+              AND hubspot_sync_status = 'pending'
+            """,
+            job_config=bq.QueryJobConfig(query_parameters=[
+                bq.ScalarQueryParameter("status", "STRING", status),
+                bq.ScalarQueryParameter("verified", "BOOL", verified),
+                bq.ArrayQueryParameter("ids", "STRING", [str(i) for i in ids]),
+            ]),
+        )
+        job.result()
+        total += job.num_dml_affected_rows or 0
+    return total
+
+
+def render_contact_review():
+    """Approve/reject researched contacts before they reach HubSpot."""
+    counts = load_stakeholder_counts()
+    st.markdown("#### Contact Review")
+    st.caption(
+        f"**{counts['pending']} awaiting review** · "
+        f"{counts['approved']} approved (ready to sync) · "
+        f"{counts['synced']} in HubSpot · {counts['rejected']} rejected. "
+        "Approved contacts sync to HubSpot tagged with municipality, signal, "
+        "and priority score; rejected ones never leave this table."
+    )
+
+    pending = load_pending_stakeholders()
+    if pending.empty:
+        st.info(
+            "Nothing to review. New contacts appear here after a Cowork "
+            "research run finishes (they arrive as 'pending')."
+        )
+        return
+
+    review_df = pending.copy()
+    review_df.insert(0, "approve", False)
+    review_df.insert(1, "reject", False)
+
+    edited = st.data_editor(
+        review_df,
+        column_order=[
+            "approve", "reject", "city", "state", "full_name", "role_title",
+            "role_category", "committee", "email", "phone", "linkedin_url",
+            "source", "source_url", "confidence",
+        ],
+        column_config={
+            "approve": st.column_config.CheckboxColumn("Approve"),
+            "reject": st.column_config.CheckboxColumn("Reject"),
+            "city": st.column_config.TextColumn("Municipality", disabled=True),
+            "state": st.column_config.TextColumn("State", width="small", disabled=True),
+            "full_name": st.column_config.TextColumn("Name", disabled=True),
+            "role_title": st.column_config.TextColumn("Title", disabled=True),
+            "role_category": st.column_config.TextColumn("Role", width="small", disabled=True),
+            "committee": st.column_config.TextColumn("Committee", disabled=True),
+            "email": st.column_config.TextColumn("Email", disabled=True),
+            "phone": st.column_config.TextColumn("Phone", disabled=True),
+            "linkedin_url": st.column_config.LinkColumn("LinkedIn", display_text="profile"),
+            "source": st.column_config.TextColumn("Source", width="small", disabled=True),
+            "source_url": st.column_config.LinkColumn("Source Link", display_text="open"),
+            "confidence": st.column_config.TextColumn("Confidence", width="small", disabled=True),
+        },
+        use_container_width=True,
+        height=380,
+        hide_index=True,
+        key="review_editor",
+    )
+
+    approve_ids = edited.loc[edited["approve"] & ~edited["reject"], "stakeholder_id"].tolist()
+    reject_ids = edited.loc[edited["reject"] & ~edited["approve"], "stakeholder_id"].tolist()
+    conflicted = int((edited["approve"] & edited["reject"]).sum())
+    if conflicted:
+        st.warning(f"{conflicted} row(s) have BOTH approve and reject ticked — they'll be skipped.")
+
+    if st.button(
+        f"Apply decisions ({len(approve_ids)} approve, {len(reject_ids)} reject)",
+        disabled=not (approve_ids or reject_ids),
+        type="primary",
+    ):
+        try:
+            n = apply_review_decisions(approve_ids, reject_ids)
+            load_pending_stakeholders.clear()
+            load_stakeholder_counts.clear()
+            load_qualified_targets.clear()
+            st.success(f"Updated {n} contact(s).")
+            st.rerun()
+        except Exception:
+            st.error("Couldn't save review decisions — check BigQuery access and try again.")
+
+
+@st.cache_data(ttl=900)
 def load_incidents() -> pd.DataFrame:
-    """Load recent news incidents from the incident monitor (last 30 days)."""
+    """Load recent news incidents from the incident monitor (last 30 days).
+    Feeds update daily; 15-min TTL keeps same-day manual runs visible."""
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
     client = _get_bigquery_client(project_id)
     try:
@@ -544,6 +776,36 @@ def render_incidents(incidents: pd.DataFrame):
     )
 
 
+def render_lead_kpis(targets: pd.DataFrame, counts: dict):
+    """Municipality-grain KPIs — the numbers that matter for lead gen."""
+    total = len(targets)
+    large = int((targets["size_tier"] == "Large").sum()) if total else 0
+    with_incidents = int((targets["n_recent_incidents"] > 0).sum()) if total else 0
+    in_flight = int(
+        targets["pipeline_status"].isin(
+            ["Queued", "Researching", "Review contacts", "Ready to sync"]
+        ).sum()
+    ) if "pipeline_status" in targets.columns and total else 0
+    in_hubspot = int((targets["n_synced"] > 0).sum()) if "n_synced" in targets.columns and total else 0
+
+    cols = st.columns(6)
+    cards = [
+        (f"{total}", "Qualified Targets", "kpi-neutral"),
+        (f"{large}", "Large (500k+)", "kpi-blue"),
+        (f"{with_incidents}", "Live Incidents", "kpi-nearing"),
+        (f"{in_flight}", "Research In Flight", "kpi-high"),
+        (f"{counts['pending']}", "Contacts To Review", "kpi-overdue" if counts['pending'] else "kpi-neutral"),
+        (f"{in_hubspot}", "In HubSpot", "kpi-prime"),
+    ]
+    for col, (val, lbl, cls) in zip(cols, cards):
+        with col:
+            st.markdown(f"""
+            <div class="kpi-card">
+                <p class="kpi-value {cls}">{val}</p>
+                <p class="kpi-label">{lbl}</p>
+            </div>""", unsafe_allow_html=True)
+
+
 def render_top_targets(targets: pd.DataFrame):
     """Render the V2 priority-scored municipality ranking (Layer 4)."""
     st.markdown("#### Top Priority Targets — Municipality Ranking")
@@ -565,10 +827,45 @@ def render_top_targets(targets: pd.DataFrame):
         "municipalities flow to the Cowork research run (prompt below), and "
         "researched contacts land in HubSpot after review."
     )
+
+    # Lead-list filters (scoped to this table; the sidebar governs the
+    # record-grain views on the other tabs)
+    fcol1, fcol2, fcol3, fcol4 = st.columns([2, 1.5, 1.5, 1.2])
+    with fcol1:
+        search = st.text_input(
+            "Search municipality", "", placeholder="e.g. Houston",
+            key="target_search",
+        )
+    with fcol2:
+        state_sel = st.multiselect(
+            "State", sorted(targets["state"].dropna().unique().tolist()),
+            default=[], placeholder="All states", key="target_states",
+        )
+    with fcol3:
+        size_sel = st.multiselect(
+            "Size", ["Large", "Medium"], default=[],
+            placeholder="All sizes", key="target_sizes",
+        )
+    with fcol4:
+        incidents_only = st.checkbox("Live incidents only", key="target_incidents")
+
+    if search:
+        targets = targets[targets["city"].fillna("").str.contains(search, case=False)]
+    if state_sel:
+        targets = targets[targets["state"].isin(state_sel)]
+    if size_sel:
+        targets = targets[targets["size_tier"].isin(size_sel)]
+    if incidents_only:
+        targets = targets[targets["n_recent_incidents"] > 0]
+    if targets.empty:
+        st.info("No targets match these filters.")
+        return
+
     event = st.dataframe(
         targets,
         column_order=[
-            "city", "state", "size_tier", "best_signal_type", "n_signals",
+            "city", "state", "pipeline_status", "size_tier",
+            "best_signal_type", "n_signals",
             "n_state_actions", "n_federal_decrees", "n_dmr",
             "n_recent_incidents", "latest_signal_date", "total_penalties",
             "population", "priority_score", "has_stakeholders",
@@ -576,6 +873,7 @@ def render_top_targets(targets: pd.DataFrame):
         column_config={
             "city": st.column_config.TextColumn("Municipality"),
             "state": st.column_config.TextColumn("State", width="small"),
+            "pipeline_status": st.column_config.TextColumn("Pipeline", width="medium"),
             "size_tier": st.column_config.TextColumn("Size", width="small"),
             "best_signal_type": st.column_config.TextColumn("Best Signal"),
             "n_signals": st.column_config.NumberColumn("Signals", format="%d"),
@@ -611,11 +909,12 @@ def render_top_targets(targets: pd.DataFrame):
             try:
                 queue_for_research(picked)
                 load_research_queue.clear()
+                load_qualified_targets.clear()  # pipeline_status shows queue state
                 st.success(
                     f"Queued: {', '.join(picked['city'].fillna('?').tolist())}"
                 )
-            except Exception as exc:
-                st.error(f"Couldn't write to research queue: {exc}")
+            except Exception:
+                st.error("Couldn't write to the research queue — check BigQuery access and try again.")
     with col_b:
         csv = targets.drop(columns=["municipality_key"]).to_csv(index=False)
         st.download_button(
@@ -661,19 +960,21 @@ def render_top_targets(targets: pd.DataFrame):
                     try:
                         n = remove_from_queue(picked["municipality_key"].tolist())
                         load_research_queue.clear()
+                        load_qualified_targets.clear()
                         st.success(f"Removed {n} from queue")
                         st.rerun()
-                    except Exception as exc:
-                        st.error(f"Couldn't remove: {exc}")
+                    except Exception:
+                        st.error("Couldn't remove from the queue — check BigQuery access and try again.")
             with clear_col:
                 if st.button("Clear entire queue"):
                     try:
                         n = remove_from_queue(queue["municipality_key"].tolist())
                         load_research_queue.clear()
+                        load_qualified_targets.clear()
                         st.success(f"Removed {n} from queue")
                         st.rerun()
-                    except Exception as exc:
-                        st.error(f"Couldn't clear: {exc}")
+                    except Exception:
+                        st.error("Couldn't clear the queue — check BigQuery access and try again.")
         st.markdown("**Paste this into Cowork to run the research:**")
         st.code(COWORK_QUEUE_PROMPT, language=None)
 
@@ -691,6 +992,10 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     not deleted).
     """
     st.sidebar.markdown("## Filters")
+    st.sidebar.caption(
+        "These filters govern the **Map & Analytics** and **All Enforcement "
+        "Data** tabs. The Lead Pipeline tab has its own filters above its table."
+    )
 
     # Municipality size (Layer 2) — default Medium + Large
     st.sidebar.markdown("### Municipality Size")
@@ -833,7 +1138,7 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
         urgency_options = ["prime", "high", "moderate", "late",
                            "nearing deadline", "overdue", "unknown", "monitoring"]
         selected_urgency = st.multiselect(
-            "Sales Priority",
+            "Lifecycle Stage",
             options=urgency_options,
             default=[],
             placeholder="All priorities",
@@ -910,6 +1215,15 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
         st.sidebar.caption(f"Last refreshed: **{last_refresh}**")
     else:
         st.sidebar.caption("Data loaded from BigQuery")
+
+    if st.sidebar.button(
+        "Reload data now",
+        help="Clears the app's data cache and re-reads everything from "
+             "BigQuery. Use after a manual pipeline run; otherwise data "
+             "auto-refreshes within an hour.",
+    ):
+        st.cache_data.clear()
+        st.rerun()
 
     if not _RUNNING_ON_CLOUD:
         if st.sidebar.button("Refresh EPA Data", help="Downloads latest EPA bulk files, reloads BigQuery, and applies deadline corrections. Takes ~5-15 minutes."):
@@ -988,7 +1302,7 @@ def render_kpis(df: pd.DataFrame):
         st.markdown(f"""
         <div class="kpi-card">
             <p class="kpi-value kpi-neutral">{total}</p>
-            <p class="kpi-label">Enforcement Actions</p>
+            <p class="kpi-label">Records In View</p>
         </div>""", unsafe_allow_html=True)
 
     with cols[1]:
@@ -1002,14 +1316,14 @@ def render_kpis(df: pd.DataFrame):
         st.markdown(f"""
         <div class="kpi-card">
             <p class="kpi-value kpi-prime">{prime}</p>
-            <p class="kpi-label">Prime Leads</p>
+            <p class="kpi-label">Prime-Stage Records</p>
         </div>""", unsafe_allow_html=True)
 
     with cols[3]:
         st.markdown(f"""
         <div class="kpi-card">
             <p class="kpi-value kpi-high">{prime + high}</p>
-            <p class="kpi-label">Prime + High</p>
+            <p class="kpi-label">Prime + High Records</p>
         </div>""", unsafe_allow_html=True)
 
     with cols[4]:
@@ -1044,7 +1358,7 @@ def render_sales_priority_key():
         margin-bottom: 8px;
     ">
         <div style="display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: center;">
-            <span style="font-size: 0.8rem; color: #999; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px;">Sales Priority</span>
+            <span style="font-size: 0.8rem; color: #999; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px;">Lifecycle Stage</span>
             <span style="display: inline-flex; align-items: center; gap: 5px;">
                 <span style="width: 10px; height: 10px; border-radius: 50%; background: #00C853; display: inline-block;"></span>
                 <span style="font-size: 0.78rem; color: #00C853; font-weight: 600;">PRIME</span>
@@ -1126,7 +1440,7 @@ def render_map(df: pd.DataFrame):
             f"{r['city']}, {r['state']}<br>"
             f"Signal: {r.get('signal_type') or '—'}<br>"
             f"Penalty: {format_currency(r['penalty_amount'])}<br>"
-            f"Priority: {r['urgency_tier'].upper()}<br>"
+            f"Stage: {r['urgency_tier'].upper()}<br>"
             f"Population: {format_population(r.get('population', 0))}"
             f" ({r.get('size_tier', 'Unknown')})"
         ),
@@ -1198,7 +1512,7 @@ def render_charts(df: pd.DataFrame):
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("#### Actions by Sales Priority")
+        st.markdown("#### Records by Lifecycle Stage")
         urgency_counts = df["urgency_tier"].value_counts().reindex(
             ["prime", "high", "moderate", "late", "nearing deadline", "overdue", "unknown", "monitoring"],
             fill_value=0,
@@ -1286,7 +1600,7 @@ def render_table(df: pd.DataFrame):
         "signal_type": st.column_config.TextColumn("Signal", width="medium"),
         "size_tier": st.column_config.TextColumn("Size", width="small"),
         "case_status": st.column_config.TextColumn("Status", width="small"),
-        "urgency_tier": st.column_config.TextColumn("Priority", width="small"),
+        "urgency_tier": st.column_config.TextColumn("Stage", width="small"),
         "consent_decree_date": st.column_config.DateColumn("Decree Date", format="YYYY-MM-DD"),
         "compliance_end_date": st.column_config.DateColumn("Deadline", format="YYYY-MM-DD"),
         "days_to_deadline": st.column_config.NumberColumn("Days Left", format="%d"),
@@ -1347,7 +1661,7 @@ to need underground pipe infrastructure inspection services. Here's how to use i
    infrastructure cases (filters out industrial facilities, private properties, etc.).
 2. **Set Case Status to "Active"** to see only current enforcement actions.
 3. **Use a preset filter button** (see below) to select the right action types for your search.
-4. **Sort by Sales Priority** — PRIME and HIGH leads are municipalities early in their
+4. **Sort by Lifecycle Stage** — PRIME and HIGH records are municipalities early in their
    compliance lifecycle, before remediation work begins. These are IPI's best opportunities.
 5. **Filter by state** to focus on a target region, or leave blank to see the national picture.
 
@@ -1384,7 +1698,7 @@ under "Large Projects" in 6-18 months.
 
 ---
 
-## Sales Priority Tiers
+## Lifecycle Stage Tiers
 
 Priority tiers are designed around IPI's sales cycle. IPI provides pre-construction
 inspection services, so municipalities **early** in the consent decree lifecycle — before
@@ -1506,14 +1820,20 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # Load data
+    # Load data — active records by default; historical toggle pulls all
+    include_history = st.sidebar.toggle(
+        "Include closed/historical records",
+        value=False,
+        help="Adds ~12k closed and likely-closed enforcement records to the "
+             "Map & Data views. Slower to load; not needed for lead work.",
+    )
     with st.spinner("Loading data from BigQuery..."):
-        df = load_data()
+        df = load_data(include_history)
 
     if df.empty:
         st.warning(
-            "No consent decree data found in BigQuery. "
-            "Run the ETL first: `python etl.py --state TX`"
+            "No enforcement data found in BigQuery. "
+            "Run the pipeline first: `bash refresh.sh` in the ETL directory."
         )
         return
 
@@ -1531,47 +1851,48 @@ def main():
     else:
         ranked = filtered
 
-    # KPI cards
-    render_kpis(ranked)
-    st.markdown("")
-
-    # Top priority targets (Layer 4 municipality-grain ranking)
-    st.markdown("---")
-    render_top_targets(load_qualified_targets())
-
-    # Live incident feed (news monitor)
-    st.markdown("---")
-    render_incidents(load_incidents())
-
-    # Map — all size tiers, independent of the ranked-list size filter
-    st.markdown("---")
-    st.markdown("#### Enforcement Map (all municipality sizes)")
-    render_map(filtered)
-    render_sales_priority_key()
-    st.caption(
-        "Map shows continental US, Alaska, Hawaii, and Caribbean territories. "
-        "Pacific territory data (GU, AS, MP) is included in the table below. "
-        "The map ignores the size-tier filter; the table below applies it."
+    tab_leads, tab_map, tab_records = st.tabs(
+        ["Lead Pipeline", "Map & Analytics", "All Enforcement Data"]
     )
 
-    # Charts
-    st.markdown("---")
-    render_charts(ranked)
+    # --- TAB 1: the lead workflow (find -> qualify -> research -> review) ---
+    with tab_leads:
+        targets = load_qualified_targets()
+        render_lead_kpis(targets, load_stakeholder_counts())
+        st.markdown("---")
+        render_top_targets(targets)
+        st.markdown("---")
+        render_contact_review()
+        st.markdown("---")
+        render_incidents(load_incidents())
 
-    # Data table — ranked list, size filter applied
-    st.markdown("---")
-    hidden = len(filtered) - len(ranked)
-    if hidden > 0:
+    # --- TAB 2: geographic + analytical views (record grain, sidebar-filtered) ---
+    with tab_map:
+        render_kpis(ranked)
+        st.markdown("")
+        st.markdown("#### Enforcement Map (all municipality sizes)")
+        render_map(filtered)
+        render_sales_priority_key()
         st.caption(
-            f"Size filter active: {hidden:,} records outside "
-            f"{', '.join(selected_sizes)} tiers are hidden from this list "
-            "(still shown on the map)."
+            "Map shows continental US, Alaska, Hawaii, and Caribbean territories. "
+            "Pacific territory data (GU, AS, MP) is included in the data tab. "
+            "The map ignores the size-tier filter; charts and the data tab apply it."
         )
-    render_table(ranked)
+        st.markdown("---")
+        render_charts(ranked)
 
-    # Data sources
-    st.markdown("---")
-    render_data_sources()
+    # --- TAB 3: the full record-grain table for analysts ---
+    with tab_records:
+        hidden = len(filtered) - len(ranked)
+        if hidden > 0:
+            st.caption(
+                f"Size filter active: {hidden:,} records outside "
+                f"{', '.join(selected_sizes)} tiers are hidden from this list "
+                "(still shown on the map)."
+            )
+        render_table(ranked)
+        st.markdown("---")
+        render_data_sources()
 
     # Footer
     st.markdown("---")
