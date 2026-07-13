@@ -744,6 +744,28 @@ def load_incidents() -> pd.DataFrame:
         return pd.DataFrame()  # monitor hasn't run yet
 
 
+@st.cache_data(ttl=900)
+def load_freshness() -> dict:
+    """Real freshness from BigQuery — trustworthy on cloud and local alike
+    (the old .last_refresh stamp file only existed on the machine that ran
+    the pipeline, and went stale)."""
+    project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
+    client = _get_bigquery_client(project_id)
+    try:
+        row = list(client.query("""
+            SELECT
+              (SELECT MAX(last_updated)  FROM `ipi_intelligence.consent_decrees`)  AS enforcement,
+              (SELECT MAX(first_seen_at) FROM `ipi_intelligence.incident_reports`) AS incidents,
+              (SELECT MAX(exported_at)   FROM `ipi_intelligence.qualified_targets`) AS targets
+        """).result())[0]
+        fmt = lambda t: t.strftime("%b %d, %H:%M UTC") if t else "never"
+        return {"enforcement": fmt(row.enforcement),
+                "incidents": fmt(row.incidents),
+                "targets": fmt(row.targets)}
+    except Exception:
+        return {"enforcement": "unknown", "incidents": "unknown", "targets": "unknown"}
+
+
 def render_incidents(incidents: pd.DataFrame):
     """Live incident feed — the 'reach out ASAP' trigger list."""
     st.markdown("#### Live Incidents — Last 30 Days")
@@ -1210,11 +1232,12 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     # --- Data Refresh (local only — ETL can't run on Streamlit Cloud) ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Data Refresh")
-    last_refresh = _get_last_refresh()
-    if last_refresh:
-        st.sidebar.caption(f"Last refreshed: **{last_refresh}**")
-    else:
-        st.sidebar.caption("Data loaded from BigQuery")
+    fresh = load_freshness()
+    st.sidebar.caption(
+        f"Enforcement data: **{fresh['enforcement']}**  \n"
+        f"Incidents: **{fresh['incidents']}**  \n"
+        f"Target list: **{fresh['targets']}**"
+    )
 
     if st.sidebar.button(
         "Reload data now",
@@ -1896,10 +1919,10 @@ def main():
 
     # Footer
     st.markdown("---")
-    last_refresh = _get_last_refresh() or "never"
+    fresh = load_freshness()
     st.markdown(
         f"<p style='text-align:center; color:#666; font-size:0.8rem;'>"
-        f"EPA data last refreshed: {last_refresh} | "
+        f"Enforcement data: {fresh['enforcement']} | Incidents: {fresh['incidents']} | "
         f"Dashboard loaded at {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         f"</p>",
         unsafe_allow_html=True,
