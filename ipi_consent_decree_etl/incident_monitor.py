@@ -47,12 +47,26 @@ load_dotenv(os.path.expanduser("~/.config/ipi-etl/.env"))  # secrets live outsid
 
 RSS_URL = "https://news.google.com/rss/search"
 
-# Search keywords — quoted phrases OR'd together per municipality
-INCIDENT_QUERY = (
-    '"sewer overflow" OR "sanitary sewer overflow" OR "sewage spill" OR '
-    '"boil water" OR "water main break" OR "wastewater violation" OR '
-    '"EPA violation" OR "consent decree"'
-)
+# Search keywords, split into SHORT query groups. Google News RSS quietly
+# degrades on long boolean queries — measured 2026-07-16: a 278-char
+# compound query returned 5 items where a 48-char query returned 91.
+# Each group is one RSS request per municipality.
+#
+# Flood/storm group added 2026-07: flooding is the trigger for IPI's
+# funding-enablement pitch (FEMA money, post-flood inflow/infiltration
+# damage) and was invisible to the original overflow-focused keyword set.
+# Disaster coverage is reported at COUNTY level, so that group's query
+# includes the county name; water-infrastructure incidents are city-level.
+KEYWORD_GROUPS = [
+    # (query phrases, include_county_in_place)
+    ('"sewer overflow" OR "sewage spill" OR "sewage overflow"', False),
+    ('"boil water" OR "water main break"', False),
+    ('"EPA violation" OR "consent decree" OR "wastewater violation"', False),
+    ('"flooding" OR "flash flood" OR "storm damage" OR "disaster declaration"', True),
+]
+
+# Kept for reference/back-compat (no longer used for querying)
+INCIDENT_QUERY = " OR ".join(g for g, _ in KEYWORD_GROUPS)
 
 # Classification: first matching pattern wins (ordered by specificity).
 # NOTE: items whose HEADLINE matches none of these are dropped entirely —
@@ -62,6 +76,8 @@ INCIDENT_TYPES = [
     ("sewer_overflow",   re.compile(r"sanitary sewer overflow|sewer overflow|sewage spill|sewage overflow|sso\b", re.I)),
     ("boil_water",       re.compile(r"boil[- ]water", re.I)),
     ("water_main_break", re.compile(r"water main break|main break", re.I)),
+    ("flooding",         re.compile(r"flood(ing|s|waters?|ed)?\b|flash flood|inundat", re.I)),
+    ("storm_damage",     re.compile(r"storm damage|severe storm|hurricane|tropical storm|disaster declaration", re.I)),
     ("consent_decree",   re.compile(r"consent decree", re.I)),
     ("epa_violation",    re.compile(r"epa violation|wastewater violation|clean water act", re.I)),
 ]
@@ -107,7 +123,7 @@ def fetch_targets(client, project_id, state=None, limit=None):
     if state:
         where += f" AND state = '{state}'"
     sql = f"""
-    SELECT municipality_key, city, state
+    SELECT municipality_key, city, state, county
     FROM `{project_id}.ipi_intelligence.qualified_targets`
     {where}
     ORDER BY priority_score DESC
@@ -117,38 +133,58 @@ def fetch_targets(client, project_id, state=None, limit=None):
     return list(client.query(sql).result())
 
 
-def query_news(city: str, state: str, session: requests.Session) -> list[dict]:
-    """One Google News RSS query for a municipality. Returns parsed items.
-
-    Precision rules (tuned on the Texas pilot, where a single Round Rock
-    story matched six other cities via body text):
-      1. headline must match an incident pattern (body-only matches dropped)
-      2. the city must appear in the headline, or in the outlet name
-         (a local outlet reporting an incident is reporting on its city)
-      3. listicle/retrospective headlines dropped
-    """
-    q = f'"{city}" "{state}" ({INCIDENT_QUERY})'
+def _fetch_rss(session: requests.Session, query: str):
+    """One RSS request; returns parsed <item> elements (or [])."""
     try:
         resp = session.get(
             RSS_URL,
-            params={"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+            params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
             timeout=30,
         )
         if resp.status_code != 200:
             return []
-        root = ET.fromstring(resp.content)
+        return list(ET.fromstring(resp.content).iter("item"))
     except (requests.RequestException, ET.ParseError):
         return []
 
+
+def query_news(city: str, state: str, session: requests.Session,
+               county: str = None) -> list[dict]:
+    """Query Google News for a municipality — one SHORT request per keyword
+    group (long boolean queries silently return near-zero results).
+
+    Precision rules (tuned on the Texas pilot, where a single Round Rock
+    story matched six other cities via body text):
+      1. headline must match an incident pattern (body-only matches dropped)
+      2. the city — or its county — must appear in the headline or the
+         outlet name (a local outlet reporting an incident is reporting on
+         its city; regional events like floods get reported by county)
+      3. listicle/retrospective headlines dropped
+    """
+    # Normalize county: FCC-enriched values arrive as "Travis County" —
+    # strip the suffix so we don't build "Travis County County"
+    if county:
+        county = re.sub(r"\s+(County|Parish|Borough)\s*$", "", county, flags=re.I).strip()
+
+    raw_items = []
+    for phrases, use_county in KEYWORD_GROUPS:
+        if use_county and county:
+            place = f'("{city}" OR "{county} County")'
+        else:
+            place = f'"{city}"'
+        raw_items.extend(_fetch_rss(session, f'{place} "{state}" ({phrases})'))
+        time.sleep(0.2)  # small gap between group requests
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     city_l = city.lower()
-    items = []
-    for item in root.iter("item"):
+    county_l = f"{county.lower()} county" if county else None
+    items, seen_urls = [], set()
+    for item in raw_items:
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         pub = (item.findtext("pubDate") or "").strip()
         source = (item.findtext("source") or "").strip()
-        if not title or not link:
+        if not title or not link or link in seen_urls:
             continue
         try:
             published = parsedate_to_datetime(pub)
@@ -162,9 +198,11 @@ def query_news(city: str, state: str, session: requests.Session) -> list[dict]:
             continue
         if LISTICLE_RE.search(title):
             continue
-        if city_l not in title.lower() and city_l not in source.lower():
+        text_l = f"{title.lower()} | {source.lower()}"
+        if city_l not in text_l and not (county_l and county_l in text_l):
             continue
 
+        seen_urls.add(link)
         items.append({
             "headline": title,
             "url": link,
@@ -197,7 +235,7 @@ def main():
     for i, t in enumerate(targets, 1):
         if not t.city:
             continue
-        items = query_news(t.city, t.state, session)
+        items = query_news(t.city, t.state, session, county=t.county)
         for it in items:
             rows.append({
                 "incident_id": hashlib.sha1(it["url"].encode()).hexdigest(),

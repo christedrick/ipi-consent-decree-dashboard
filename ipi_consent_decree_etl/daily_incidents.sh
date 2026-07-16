@@ -26,8 +26,9 @@ PY="$SCRIPT_DIR/venv/bin/python"
 {
   echo "=== Daily incident scan: $(date) ==="
   "$PY" "$SCRIPT_DIR/incident_monitor.py" || echo "news monitor failed ($?)"
-  "$PY" "$SCRIPT_DIR/structured_incidents.py" || echo "NRC feed failed ($?)"
+  "$PY" "$SCRIPT_DIR/structured_incidents.py" || echo "NRC/FEMA feed failed ($?)"
   "$PY" "$SCRIPT_DIR/export_targets.py" || echo "target export failed ($?)"
+  "$PY" "$SCRIPT_DIR/enrich_geo.py" || echo "geo enrichment failed ($?)"
   echo "=== Done: $(date) ==="
 } >> "$LOG" 2>&1
 

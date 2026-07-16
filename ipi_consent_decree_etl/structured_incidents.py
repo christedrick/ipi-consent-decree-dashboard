@@ -50,6 +50,14 @@ def _norm_city(c: str) -> str:
     return re.sub(r"[^a-z ]", "", (c or "").lower()).strip()
 
 
+def _norm_county(c: str) -> str:
+    """'Harris County' / 'Harris (County)' / 'Harris' -> 'harris'.
+    FCC returns the suffixed form; FEMA designates the bare name."""
+    c = re.sub(r"\s*\((County|Parish|Borough)\)\s*$", "", c or "", flags=re.I)
+    c = re.sub(r"\s+(County|Parish|Borough)\s*$", "", c, flags=re.I)
+    return c.strip().lower()
+
+
 def _parse_nrc_datetime(raw):
     """NRC workbook dates arrive as 'M/D/YYYY H:MM' strings (sometimes as
     real datetime cells). Returns tz-aware UTC datetime or None."""
@@ -81,7 +89,7 @@ def fetch_targets(client, project_id):
 # NRC adapter
 # ---------------------------------------------------------------------------
 
-def fetch_nrc(targets: dict) -> list[dict]:
+def fetch_nrc(targets: dict, geo_by_county: dict = None) -> list[dict]:
     """Download the current-year NRC workbook and return sewage incidents
     at qualified municipalities within the lookback window."""
     now = datetime.now(timezone.utc)
@@ -171,9 +179,93 @@ def fetch_nrc(targets: dict) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# FEMA adapter — disaster declarations (OpenFEMA API, free, no key)
+# ---------------------------------------------------------------------------
+
+FEMA_API = "https://www.fema.gov/api/open/v2/DisasterDeclarationsSummaries"
+FEMA_LOOKBACK_DAYS = 45  # declarations lag events by days-to-weeks
+FEMA_INCIDENT_TYPES = {
+    "Flood", "Severe Storm", "Severe Storm(s)", "Hurricane", "Tropical Storm",
+    "Coastal Storm", "Dam/Levee Break", "Mud/Landslide", "Typhoon",
+}
+
+
+def fetch_fema(targets: dict, geo_by_county: dict = None) -> list[dict]:
+    """Recent FEMA disaster declarations matched to qualified municipalities
+    by designated county. A declaration is the moment FEMA money (BRIC/ODR)
+    becomes real for a municipality — IPI's funding-enablement trigger.
+
+    designatedArea arrives as e.g. 'Kerr (County)'; municipalities are
+    matched via their enriched county (see enrich_geo.py).
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=FEMA_LOOKBACK_DAYS)).strftime("%Y-%m-%dT00:00:00.000z")
+
+    # Build (county_norm, state) -> [(municipality_key, city)] from targets
+    by_county = {}
+    for (city_norm, state), (key, city) in targets.items():
+        county = (geo_by_county or {}).get(key)
+        if county:
+            by_county.setdefault((_norm_county(county), state), []).append((key, city))
+    if not by_county:
+        print("FEMA: no county-enriched targets yet — run enrich_geo.py first")
+        return []
+
+    try:
+        resp = requests.get(
+            FEMA_API,
+            params={
+                "$filter": f"declarationDate gt '{cutoff}'",
+                "$select": "disasterNumber,state,declarationDate,incidentType,"
+                           "declarationTitle,designatedArea",
+                "$top": "1000",
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        decls = resp.json().get("DisasterDeclarationsSummaries", [])
+    except Exception as exc:
+        print(f"FEMA API error: {exc}", file=sys.stderr)
+        return []
+
+    out, matched_decls = [], 0
+    for d in decls:
+        if d.get("incidentType") not in FEMA_INCIDENT_TYPES:
+            continue
+        area = (d.get("designatedArea") or "")
+        county = _norm_county(area)
+        state = (d.get("state") or "").upper()
+        hits = by_county.get((county, state), [])
+        if not hits:
+            continue
+        matched_decls += 1
+        dnum = d.get("disasterNumber")
+        title = d.get("declarationTitle") or d.get("incidentType")
+        decl_date = (d.get("declarationDate") or "")[:19] + "+00:00"
+        for key, city in hits:
+            out.append({
+                "incident_id": hashlib.sha1(f"FEMA-{dnum}-{key}".encode()).hexdigest(),
+                "municipality_key": key,
+                "city": city,
+                "state": state,
+                "headline": f"FEMA DR-{dnum} ({d.get('incidentType')}): {title} — {county.title()} County designated"[:500],
+                "url": f"https://www.fema.gov/disaster/{dnum}",
+                "news_source": "FEMA Disaster Declarations",
+                "incident_type": "fema_disaster",
+                "published_at": decl_date,
+                "first_seen_at": now.isoformat(),
+            })
+
+    print(f"FEMA: {len(decls)} declarations in last {FEMA_LOOKBACK_DAYS}d | "
+          f"{matched_decls} county matches | {len(out)} municipality incidents")
+    return out
+
+
 # Adapter registry — add state adapters here as their endpoints get built.
 ADAPTERS = {
     "nrc": fetch_nrc,
+    "fema": fetch_fema,
     # "tx_tceq": fetch_tx_tceq,     # interactive portal — needs RE pass
     # "ca_ciwqs": fetch_ca_ciwqs,   # session servlet — needs RE pass
     # "fl_pnp": fetch_fl_pnp,       # session app — needs RE pass
@@ -230,10 +322,24 @@ def main():
     targets = fetch_targets(client, project_id)
     print(f"Qualified Medium/Large targets: {len(targets)}")
 
+    # County lookup (enrich_geo.py) — keyed by municipality_key
+    geo_by_county = {}
+    try:
+        geo_by_county = {
+            r.municipality_key: r.county
+            for r in client.query(f"""
+                SELECT municipality_key, county
+                FROM `{project_id}.ipi_intelligence.municipality_geo`
+                WHERE county IS NOT NULL
+            """).result()
+        }
+    except Exception:
+        pass  # table may not exist yet; FEMA adapter degrades gracefully
+
     all_rows = []
     for name, adapter in ADAPTERS.items():
         try:
-            all_rows.extend(adapter(targets))
+            all_rows.extend(adapter(targets, geo_by_county))
         except Exception as exc:
             print(f"Adapter {name} failed: {exc}", file=sys.stderr)
 

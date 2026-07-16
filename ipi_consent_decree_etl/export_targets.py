@@ -157,7 +157,12 @@ scored AS (
   LEFT JOIN incidents USING (municipality_key)
 )
 SELECT
-  municipality_key, city, state, county, primary_facility,
+  municipality_key, scored.city, scored.state,
+  -- EPA records mostly lack county; municipality_geo (enrich_geo.py,
+  -- FCC reverse geocode) fills the gap for regional matching (floods,
+  -- FEMA declarations are county-designated)
+  COALESCE(NULLIF(scored.county, ''), geo.county) AS county,
+  primary_facility,
   population, size_tier,
   best_signal_rank, best_signal_type,
   n_signals, n_state_actions, n_federal_decrees, n_federal_other, n_dmr,
@@ -170,6 +175,8 @@ SELECT
   latest_incident_at,
   CURRENT_TIMESTAMP() AS exported_at
 FROM scored
+LEFT JOIN `{project}.ipi_intelligence.municipality_geo` geo
+  USING (municipality_key)
 WHERE size_tier IN ({tier_list})
 ORDER BY priority_score DESC, total_penalties DESC
 """
@@ -220,11 +227,13 @@ def main():
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
     client = bigquery.Client(project=project_id)
 
-    # Staging + incidents tables must exist BEFORE the export — the
-    # reachability and incidents CTEs join them (first-run safety).
+    # Staging + incidents + geo tables must exist BEFORE the export — the
+    # CTEs and final SELECT join them (first-run safety).
     client.query(STAKEHOLDERS_STAGING_DDL.format(project=project_id)).result()
     from incident_monitor import INCIDENTS_DDL
     client.query(INCIDENTS_DDL.format(project=project_id)).result()
+    from enrich_geo import GEO_DDL
+    client.query(GEO_DDL.format(project=project_id)).result()
 
     # SQL placeholder for signal-volume inside aggregate scope
     sql = QUALIFIED_TARGETS_SQL.replace(
