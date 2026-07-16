@@ -1,0 +1,54 @@
+# Daily incident scan — cloud replacement for the MacBook LaunchAgent
+# (com.ipi.incident-monitor), which only ran while the laptop was awake.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   GCP_SA_KEY       — full JSON of the BigQuery service-account key
+#   CENSUS_API_KEY   — US Census API key (only used by the full refresh,
+#                      but kept here so both workflows share the same setup)
+name: Daily incident scan
+
+on:
+  schedule:
+    - cron: "30 11 * * *"   # 11:30 UTC ≈ 7:30am ET (6:30 in winter)
+  workflow_dispatch: {}      # manual "Run workflow" button
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ipi_consent_decree_etl
+    env:
+      GCP_PROJECT_ID: ipi-consent-decree-dashboard
+      GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-sa.json
+      CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -q -r requirements.txt openpyxl
+
+      - name: Write service-account key
+        run: printf '%s' '${{ secrets.GCP_SA_KEY }}' > /tmp/gcp-sa.json
+
+      - name: News incident monitor
+        run: python incident_monitor.py
+
+      - name: Structured feeds (NRC + FEMA)
+        run: python structured_incidents.py
+
+      - name: Rebuild qualified target list
+        run: python export_targets.py
+
+      - name: County geo enrichment (new targets only)
+        run: python enrich_geo.py
+
+      - name: Scrub credentials
+        if: always()
+        run: rm -f /tmp/gcp-sa.json

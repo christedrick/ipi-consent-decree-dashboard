@@ -48,6 +48,38 @@ def _get_bigquery_client(project_id):
     return bigquery.Client(project=project_id)
 
 # ---------------------------------------------------------------------------
+# Access control — write actions are editor-only when sharing is enabled
+# ---------------------------------------------------------------------------
+
+def _viewer_email() -> str:
+    """Signed-in viewer's email (Streamlit Cloud provides it on private apps)."""
+    try:
+        return (getattr(st.user, "email", "") or "").lower()
+    except Exception:
+        return ""
+
+
+def can_edit() -> bool:
+    """True if this viewer may use write actions (queue research, review
+    contacts). Controlled by an `editors` list in Streamlit secrets:
+
+        editors = ["tedrickc@gmail.com", "someone@ipi-pipe.com"]
+
+    If the secret is absent, everyone with access can edit (single-team
+    mode — today's behavior). Local development is always unrestricted.
+    """
+    if not _RUNNING_ON_CLOUD:
+        return True
+    try:
+        editors = [str(e).strip().lower() for e in st.secrets.get("editors", [])]
+    except Exception:
+        editors = []
+    if not editors:
+        return True
+    return _viewer_email() in editors
+
+
+# ---------------------------------------------------------------------------
 # ETL refresh helpers
 # ---------------------------------------------------------------------------
 
@@ -669,6 +701,11 @@ def render_contact_review():
         )
         return
 
+    if not can_edit():
+        st.caption("View-only access — an editor approves or rejects these.")
+        st.dataframe(pending, use_container_width=True, height=380, hide_index=True)
+        return
+
     review_df = pending.copy()
     review_df.insert(0, "approve", False)
     review_df.insert(1, "reject", False)
@@ -924,8 +961,9 @@ def render_top_targets(targets: pd.DataFrame):
     with col_a:
         if st.button(
             f"Queue {len(selected_rows)} selected for contact research",
-            disabled=not selected_rows,
+            disabled=not selected_rows or not can_edit(),
             type="primary",
+            help=None if can_edit() else "View-only access — ask an editor to queue targets",
         ):
             picked = targets.iloc[selected_rows]
             try:
@@ -976,7 +1014,7 @@ def render_top_targets(targets: pd.DataFrame):
             with rm_col:
                 if st.button(
                     f"Remove {len(q_selected)} selected from queue",
-                    disabled=not q_selected,
+                    disabled=not q_selected or not can_edit(),
                 ):
                     picked = queue.iloc[q_selected]
                     try:
@@ -988,7 +1026,7 @@ def render_top_targets(targets: pd.DataFrame):
                     except Exception:
                         st.error("Couldn't remove from the queue — check BigQuery access and try again.")
             with clear_col:
-                if st.button("Clear entire queue"):
+                if st.button("Clear entire queue", disabled=not can_edit()):
                     try:
                         n = remove_from_queue(queue["municipality_key"].tolist())
                         load_research_queue.clear()
