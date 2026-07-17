@@ -768,7 +768,7 @@ def load_incidents() -> pd.DataFrame:
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
     client = _get_bigquery_client(project_id)
     try:
-        return client.query("""
+        df = client.query("""
             SELECT published_at, city, state, incident_type, headline,
                    url, news_source
             FROM `ipi_intelligence.incident_reports`
@@ -777,6 +777,13 @@ def load_incidents() -> pd.DataFrame:
             ORDER BY published_at DESC
             LIMIT 200
         """).to_dataframe()
+        if not df.empty:
+            # BigQuery returns UTC; display in Eastern so "tonight's" news
+            # doesn't show tomorrow's date.
+            df["published_at"] = (
+                df["published_at"].dt.tz_convert("US/Eastern").dt.tz_localize(None)
+            )
+        return df
     except Exception:
         return pd.DataFrame()  # monitor hasn't run yet
 
@@ -795,7 +802,8 @@ def load_freshness() -> dict:
               (SELECT MAX(first_seen_at) FROM `ipi_intelligence.incident_reports`) AS incidents,
               (SELECT MAX(exported_at)   FROM `ipi_intelligence.qualified_targets`) AS targets
         """).result())[0]
-        fmt = lambda t: t.strftime("%b %d, %H:%M UTC") if t else "never"
+        fmt = lambda t: (pd.Timestamp(t).tz_convert("US/Eastern")
+                         .strftime("%b %d, %I:%M %p ET").lstrip("0")) if t else "never"
         return {"enforcement": fmt(row.enforcement),
                 "incidents": fmt(row.incidents),
                 "targets": fmt(row.targets)}
@@ -821,7 +829,7 @@ def render_incidents(incidents: pd.DataFrame):
     st.dataframe(
         incidents,
         column_config={
-            "published_at": st.column_config.DatetimeColumn("Published", format="MMM DD, HH:mm"),
+            "published_at": st.column_config.DatetimeColumn("Published (ET)", format="MMM DD, HH:mm"),
             "city": st.column_config.TextColumn("Municipality"),
             "state": st.column_config.TextColumn("State", width="small"),
             "incident_type": st.column_config.TextColumn("Type", width="small"),
@@ -1043,86 +1051,73 @@ def render_top_targets(targets: pd.DataFrame):
 # Sidebar filters
 # ---------------------------------------------------------------------------
 
-def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
-    """Render sidebar filters.
+def render_record_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
+    """Record-grain filters, rendered at the top of the Map & Analytics tab
+    (the All Enforcement Data tab inherits the same selection).
 
     Returns (filtered_df, size_tiers_for_ranked_list). The size-tier
-    selection is returned separately because it applies ONLY to the ranked
-    table — small municipalities stay visible on the map (deprioritized,
-    not deleted).
+    selection is returned separately because it applies ONLY to the data
+    tab's ranked table — the map always shows all sizes.
     """
-    st.sidebar.markdown("## Filters")
-    st.sidebar.caption(
-        "These filters govern the **Map & Analytics** and **All Enforcement "
-        "Data** tabs. The Lead Pipeline tab has its own filters above its table."
-    )
+    st.markdown("#### Record Filters")
 
-    # Municipality size (Layer 2) — default Medium + Large
-    st.sidebar.markdown("### Municipality Size")
-    size_options = ["Large", "Medium", "Small", "Unknown"]
-    selected_sizes = st.sidebar.multiselect(
-        "Size Tier (ranked list only)",
-        options=size_options,
-        default=["Large", "Medium"],
-        help="Small < 100k | Medium 100k-500k | Large 500k+ (service-area "
-             "population). Applies to the ranked table; the map always shows "
-             "all sizes. 'Unknown' = no population data on record.",
-    )
+    row1 = st.columns([1.2, 1.2, 1.2, 1.2])
+    with row1[0]:
+        if "case_status" in df.columns:
+            status_options = sorted(df["case_status"].dropna().unique().tolist())
+        else:
+            status_options = ["Active", "Closed", "Likely Closed", "Unknown"]
+        selected_status = st.multiselect(
+            "Case Status",
+            options=status_options,
+            default=["Active"] if "Active" in status_options else [],
+            help="Active = confirmed open enforcement action | Likely Closed = state action older than 5 years",
+        )
+    with row1[1]:
+        _signal_order = [
+            "State Enforcement Action", "Federal Consent Decree",
+            "Federal Enforcement Action", "DMR Violation", "Unclassified",
+        ]
+        present_signals = (
+            df["signal_type"].dropna().unique().tolist()
+            if "signal_type" in df.columns else []
+        )
+        signal_options = [s for s in _signal_order if s in present_signals] or _signal_order
+        selected_signals = st.multiselect(
+            "Signal Type",
+            options=signal_options,
+            default=[],
+            placeholder="All signals",
+            help="State actions = leading indicator | Federal consent decrees = "
+                 "secondary signal | DMR Violation = monitoring-only discovery tier",
+        )
+    with row1[2]:
+        states = sorted(df["state"].dropna().unique().tolist())
+        selected_states = st.multiselect(
+            "States & Territories",
+            options=states,
+            default=[],
+            placeholder="All states & territories",
+        )
+    with row1[3]:
+        size_options = ["Large", "Medium", "Small", "Unknown"]
+        selected_sizes = st.multiselect(
+            "Size Tier (data tab)",
+            options=size_options,
+            default=["Large", "Medium"],
+            help="Small < 100k | Medium 100k-500k | Large 500k+ (service-area "
+                 "population). Applies to the data tab's table; the map always "
+                 "shows all sizes. 'Unknown' = no population data on record.",
+        )
 
-    # Case status filter — default to Active only
-    st.sidebar.markdown("### Case Status")
-    if "case_status" in df.columns:
-        status_options = sorted(df["case_status"].dropna().unique().tolist())
-    else:
-        status_options = ["Active", "Closed", "Likely Closed", "Unknown"]
-    selected_status = st.sidebar.multiselect(
-        "Case Status",
-        options=status_options,
-        default=["Active"] if "Active" in status_options else [],
-        help="Active = confirmed open enforcement action | Likely Closed = state action older than 5 years",
-    )
-
-    # Pipe infrastructure filter — key for IPI's business
-    pipe_only = st.sidebar.checkbox(
+    pipe_only = st.checkbox(
         "Pipe infrastructure only",
         value=False,
         help="Show only records flagged for sewer/collection system/pipe infrastructure issues "
              "(SSO, CSO, pipeline, wastewater, POTW, etc.)",
     )
 
-    # Signal type filter (V2) — supersedes the old Enforcement Level filter
-    st.sidebar.markdown("### Signal Type")
-    _signal_order = [
-        "State Enforcement Action", "Federal Consent Decree",
-        "Federal Enforcement Action", "DMR Violation", "Unclassified",
-    ]
-    present_signals = (
-        df["signal_type"].dropna().unique().tolist()
-        if "signal_type" in df.columns else []
-    )
-    signal_options = [s for s in _signal_order if s in present_signals] or _signal_order
-    selected_signals = st.sidebar.multiselect(
-        "Signal Type",
-        options=signal_options,
-        default=[],
-        placeholder="All signals",
-        help="State actions = leading indicator | Federal consent decrees = "
-             "secondary signal | DMR Violation = monitoring-only discovery tier",
-    )
-
-    # State filter
-    states = sorted(df["state"].dropna().unique().tolist())
-    selected_states = st.sidebar.multiselect(
-        "States & Territories",
-        options=states,
-        default=[],
-        placeholder="All states & territories",
-    )
-
-    # ---- Advanced filters (collapsed by default — V2 simplification: the
-    # signal hierarchy + size tiers + priority score replace most day-to-day
-    # use of these) ----
-    with st.sidebar.expander("Advanced filters"):
+    with st.expander("Advanced filters"):
         if "action_type" in df.columns:
             action_types = sorted(df["action_type"].dropna().unique().tolist())
         else:
@@ -1258,15 +1253,19 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
 
     filtered = filtered[filtered["penalty_amount"] >= penalty_range]
 
-    # Summary in sidebar — state first (V2 primary signal)
-    st.sidebar.markdown("---")
+    # Inline summary — state first (V2 primary signal)
     federal_count = len(filtered[filtered.get("enforcement_level", pd.Series()) == "Federal"]) if "enforcement_level" in filtered.columns else 0
     state_count = len(filtered[filtered.get("enforcement_level", pd.Series()) == "State"]) if "enforcement_level" in filtered.columns else 0
-    st.sidebar.markdown(
-        f"**Showing {len(filtered)}** of {len(df)} records\n\n"
-        f"State: **{state_count}** | Federal: **{federal_count}**"
+    st.caption(
+        f"Showing **{len(filtered):,}** of {len(df):,} records · "
+        f"State: **{state_count:,}** | Federal: **{federal_count:,}**"
     )
 
+    return filtered, selected_sizes
+
+
+def render_sidebar_utilities():
+    """Sidebar keeps only global utilities: freshness, reload, data quality."""
     # --- Data Refresh (local only — ETL can't run on Streamlit Cloud) ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Data Refresh")
@@ -1302,8 +1301,6 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
 
     # --- Data Quality ---
     _render_data_quality_badge()
-
-    return filtered, selected_sizes
 
 
 def _render_data_quality_badge():
@@ -1898,19 +1895,8 @@ def main():
         )
         return
 
-    # Sidebar filters
-    filtered, selected_sizes = render_sidebar(df)
-
-    if filtered.empty:
-        st.info("No records match the current filters. Try adjusting the sidebar filters.")
-        return
-
-    # Size filter applies to the RANKED LIST only — the map keeps all sizes
-    # visible (small municipalities deprioritized, not deleted).
-    if selected_sizes and "size_tier" in filtered.columns:
-        ranked = filtered[filtered["size_tier"].isin(selected_sizes)]
-    else:
-        ranked = filtered
+    # Sidebar: global utilities only — filters live on the tabs they govern
+    render_sidebar_utilities()
 
     tab_leads, tab_map, tab_records = st.tabs(
         ["Lead Pipeline", "Map & Analytics", "All Enforcement Data"]
@@ -1927,33 +1913,52 @@ def main():
         st.markdown("---")
         render_incidents(load_incidents())
 
-    # --- TAB 2: geographic + analytical views (record grain, sidebar-filtered) ---
+    # --- TAB 2: geographic + analytical views; owns the record filters ---
     with tab_map:
-        render_kpis(ranked)
-        st.markdown("")
-        st.markdown("#### Enforcement Map (all municipality sizes)")
-        render_map(filtered)
-        render_sales_priority_key()
-        st.caption(
-            "Map shows continental US, Alaska, Hawaii, and Caribbean territories. "
-            "Pacific territory data (GU, AS, MP) is included in the data tab. "
-            "The map ignores the size-tier filter; charts and the data tab apply it."
-        )
-        st.markdown("---")
-        render_charts(ranked)
+        filtered, selected_sizes = render_record_filters(df)
+        # Size filter applies to the data tab's ranked list — the map keeps
+        # all sizes visible (small municipalities deprioritized, not deleted).
+        if selected_sizes and "size_tier" in filtered.columns:
+            ranked = filtered[filtered["size_tier"].isin(selected_sizes)]
+        else:
+            ranked = filtered
+
+        if filtered.empty:
+            st.info("No records match the current filters.")
+        else:
+            st.markdown("---")
+            render_kpis(ranked)
+            st.markdown("")
+            st.markdown("#### Enforcement Map (all municipality sizes)")
+            render_map(filtered)
+            render_sales_priority_key()
+            st.caption(
+                "Map shows continental US, Alaska, Hawaii, and Caribbean territories. "
+                "Pacific territory data (GU, AS, MP) is included in the data tab. "
+                "The map ignores the size-tier filter; charts and the data tab apply it."
+            )
+            st.markdown("---")
+            render_charts(ranked)
 
     # --- TAB 3: the full record-grain table for analysts ---
     with tab_records:
-        hidden = len(filtered) - len(ranked)
-        if hidden > 0:
-            st.caption(
-                f"Size filter active: {hidden:,} records outside "
-                f"{', '.join(selected_sizes)} tiers are hidden from this list "
-                "(still shown on the map)."
-            )
-        render_table(ranked)
-        st.markdown("---")
-        render_data_sources()
+        st.caption(
+            "This table follows the **Record Filters set on the Map & "
+            "Analytics tab** (including the size-tier selection)."
+        )
+        if filtered.empty:
+            st.info("No records match the current filters.")
+        else:
+            hidden = len(filtered) - len(ranked)
+            if hidden > 0:
+                st.caption(
+                    f"Size filter active: {hidden:,} records outside "
+                    f"{', '.join(selected_sizes)} tiers are hidden from this list "
+                    "(still shown on the map)."
+                )
+            render_table(ranked)
+            st.markdown("---")
+            render_data_sources()
 
     # Footer
     st.markdown("---")
@@ -1961,7 +1966,7 @@ def main():
     st.markdown(
         f"<p style='text-align:center; color:#666; font-size:0.8rem;'>"
         f"Enforcement data: {fresh['enforcement']} | Incidents: {fresh['incidents']} | "
-        f"Dashboard loaded at {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        f"Dashboard loaded at {pd.Timestamp.now(tz='US/Eastern').strftime('%Y-%m-%d %I:%M %p ET')}"
         f"</p>",
         unsafe_allow_html=True,
     )
