@@ -1,4 +1,16 @@
-# Security Setup — remaining manual steps
+# Security Setup — COMPLETED 2026-07-16
+
+All steps below were executed on 2026-07-16 (kept for reference/audit):
+- dashboard-reader SA live in Streamlit (dataset Viewer + table-level
+  Editor on research_queue + stakeholders_staging)
+- claude-cnkt pipeline key rotated (old OneDrive-era key deleted);
+  new key lives ONLY in ~/.config/ipi-etl/ and the GitHub GCP_SA_KEY secret
+- editors allowlist gates dashboard write actions
+
+Note: incident_reports needs no editor grant today — the dashboard only
+reads it; the dismissed flag is set via SQL until a dismiss button exists.
+
+# Original setup steps (historical)
 
 Two items from the security audit need Google Cloud console access (I can't
 do them from the CLI on this machine). Both are ~10 minutes.
