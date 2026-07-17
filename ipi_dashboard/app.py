@@ -781,7 +781,7 @@ def load_incidents() -> pd.DataFrame:
             # BigQuery returns UTC; display in Eastern so "tonight's" news
             # doesn't show tomorrow's date.
             df["published_at"] = (
-                df["published_at"].dt.tz_convert("US/Eastern").dt.tz_localize(None)
+                df["published_at"].dt.tz_convert("America/New_York").dt.tz_localize(None)
             )
         return df
     except Exception:
@@ -802,7 +802,7 @@ def load_freshness() -> dict:
               (SELECT MAX(first_seen_at) FROM `ipi_intelligence.incident_reports`) AS incidents,
               (SELECT MAX(exported_at)   FROM `ipi_intelligence.qualified_targets`) AS targets
         """).result())[0]
-        fmt = lambda t: (pd.Timestamp(t).tz_convert("US/Eastern")
+        fmt = lambda t: (pd.Timestamp(t).tz_convert("America/New_York")
                          .strftime("%b %d, %I:%M %p ET").lstrip("0")) if t else "never"
         return {"enforcement": fmt(row.enforcement),
                 "incidents": fmt(row.incidents),
@@ -1966,7 +1966,7 @@ def main():
     st.markdown(
         f"<p style='text-align:center; color:#666; font-size:0.8rem;'>"
         f"Enforcement data: {fresh['enforcement']} | Incidents: {fresh['incidents']} | "
-        f"Dashboard loaded at {pd.Timestamp.now(tz='US/Eastern').strftime('%Y-%m-%d %I:%M %p ET')}"
+        f"Dashboard loaded at {pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %I:%M %p ET')}"
         f"</p>",
         unsafe_allow_html=True,
     )
