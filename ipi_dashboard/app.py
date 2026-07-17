@@ -1710,18 +1710,27 @@ Within each signal tier, records sort by sales-priority recency (PRIME first), t
 
 ---
 
-## Quick Start — Finding Leads
+## Quick Start — The Lead Workflow
 
-This dashboard helps IPI identify municipalities under EPA/state enforcement that are likely
-to need underground pipe infrastructure inspection services. Here's how to use it:
+The dashboard is organized as three tabs:
 
-1. **Enable "Pipe infrastructure only"** in the sidebar to focus on municipal water/wastewater
-   infrastructure cases (filters out industrial facilities, private properties, etc.).
-2. **Set Case Status to "Active"** to see only current enforcement actions.
-3. **Use a preset filter button** (see below) to select the right action types for your search.
-4. **Sort by Lifecycle Stage** — PRIME and HIGH records are municipalities early in their
-   compliance lifecycle, before remediation work begins. These are IPI's best opportunities.
-5. **Filter by state** to focus on a target region, or leave blank to see the national picture.
+1. **Lead Pipeline** (the money view) — one row per qualified municipality
+   (Medium/Large with an active signal), ranked by **Priority Score**. The
+   workflow runs left to right: tick promising targets → **Queue for contact
+   research** → run the Cowork prompt (in the queue expander) → researched
+   contacts come back to **Contact Review** → approve → they land in HubSpot
+   tagged with municipality, signal, and score. The **Live Incidents** feed
+   below flags same-week outreach openings.
+2. **Map & Analytics** — record-grain exploration. The **Record Filters** at
+   the top of this tab (case status, signal type, state, size, pipe-only,
+   plus Advanced) drive the map, charts, and the data tab.
+3. **All Enforcement Data** — the full record table under the same filters,
+   with CSV export and this methodology section.
+
+**Priority Score** components: signal strength (state action 40 > federal
+decree 30 > other federal 20 > DMR 10) + signal volume + size tier +
+recency + pipe-infrastructure flag + live-incident bonus (+10) +
+stakeholder reachability (+15 once contacts are approved).
 
 ---
 
@@ -1773,6 +1782,7 @@ Tiers are evaluated top-to-bottom (first match wins):
 | **LATE** | 1-5 years to deadline, or issued 5+ years ago | Construction likely underway; some opportunity may remain |
 | **MODERATE** | Issued 2-5 years ago, OR 5-10 years to deadline | Mid-lifecycle — limited opportunity |
 | **UNKNOWN** | No issuance date or deadline on record | Needs research before outreach |
+| **MONITORING** | DMR/QNCR effluent violations only — no enforcement action yet | Discovery tier — earliest signal, excluded from Prime/High counts |
 
 **Why this order matters**: PRIME and HIGH are checked before deadline-driven tiers because
 IPI's value is highest at the **start** of the consent decree lifecycle. A recently issued
@@ -1842,19 +1852,31 @@ included in the "Large Projects" preset.
 
 ---
 
-## Data Sources & Freshness
+## Data Sources & Refresh Schedule
 
-**Federal**: EPA ICIS-FE&C bulk download files — all federal CWA and SDWA enforcement actions.
-Court-ordered deadlines supplemented from DOJ/EPA press releases.
+| Source | What it feeds | Updated |
+|--------|---------------|---------|
+| EPA ICIS-FE&C bulk files | Federal CWA/SDWA enforcement actions (deadlines supplemented from DOJ/EPA press releases) | EPA publishes weekly; auto-ingested 1st & 15th |
+| EPA NPDES bulk files | State-level formal enforcement, all 50 states + territories — the **primary signal** | EPA publishes weekly; auto-ingested 1st & 15th |
+| EPA QNCR (same NPDES files) | DMR/effluent noncompliance — the rank-4 monitoring tier | Quarterly by nature (expect 1-4 months lag) |
+| Google News monitoring | Live incidents: sewer overflows, boil-water advisories, main breaks, flooding — searched per Medium/Large target | **Daily, ~7:30am ET** |
+| National Response Center (USCG FOIA workbook) | Federally-mandated sewage spill reports — catches incidents that never make the news | Weekly file, checked daily |
+| FEMA disaster declarations | County-level disaster context for targets | Checked daily |
+| US Census ACS | Service-area population → size tiers | Annual |
 
-**State**: EPA NPDES bulk download files — state-level formal enforcement from all 50 states
-and US territories.
+**How refresh works now**: everything runs automatically in the cloud
+(GitHub Actions) — a daily incident scan each morning and a full EPA
+re-ingest on the 1st and 15th, followed by automated validation
+(placeholder deadlines, suspect penalties, non-municipal flags). Actual
+per-source timestamps are always shown in the sidebar under **Data
+Refresh**; the **Reload data now** button re-reads BigQuery immediately
+instead of within the hour. There is nothing to run manually.
 
-**Population**: US Census Bureau American Community Survey (ACS) estimates.
-
-**Freshness**: EPA updates bulk files weekly (typically Monday). Use the **"Refresh EPA Data"**
-button in the sidebar to download the latest files. After each refresh, automated validation
-checks for placeholder deadlines, suspect penalties, and non-municipal facility flags.
+**Contact pipeline**: municipality research is queued from the Lead
+Pipeline tab, executed in Claude Cowork (Ballotpedia → municipal sites →
+Clay → LinkedIn verification), reviewed in **Contact Review**, and synced
+to HubSpot with `ipi_audience_segment` set per role. Only approved
+contacts ever reach the CRM.
         """)
 
 
