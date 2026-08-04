@@ -510,6 +510,9 @@ def load_qualified_targets() -> pd.DataFrame:
         return pd.DataFrame()  # table not exported yet
 
 
+# Bootstrap DDL — run once by an admin/pipeline credential, NOT by the app:
+# the dashboard's least-privilege account has row-write on this table but
+# (deliberately) no dataset-level CREATE rights.
 RESEARCH_QUEUE_DDL = """
 CREATE TABLE IF NOT EXISTS `ipi_intelligence.research_queue` (
   municipality_key STRING NOT NULL,
@@ -528,7 +531,6 @@ def queue_for_research(selected: pd.DataFrame) -> int:
     Fully parameterized — no SQL built from strings."""
     project_id = os.getenv("GCP_PROJECT_ID", "ipi-consent-decree-dashboard")
     client = _get_bigquery_client(project_id)
-    client.query(RESEARCH_QUEUE_DDL).result()
 
     from google.cloud import bigquery as bq
     row_params = [
