@@ -1265,7 +1265,24 @@ def render_record_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
 
 
 def render_sidebar_utilities():
-    """Sidebar keeps only global utilities: freshness, reload, data quality."""
+    """Sidebar keeps only global utilities: identity, freshness, reload,
+    data quality."""
+    # Who does the app think you are? (This is what the editors list is
+    # checked against — surfacing it makes access issues self-diagnosing.)
+    if _RUNNING_ON_CLOUD:
+        email = _viewer_email()
+        if not email:
+            st.sidebar.caption(
+                "Signed in as: **not detected** — write actions are "
+                "view-only because the app can't read your login email."
+            )
+        elif can_edit():
+            st.sidebar.caption(f"Signed in as: **{email}** (editor)")
+        else:
+            st.sidebar.caption(
+                f"Signed in as: **{email}** (view-only — this email isn't "
+                "on the editors list)"
+            )
     # --- Data Refresh (local only — ETL can't run on Streamlit Cloud) ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Data Refresh")
