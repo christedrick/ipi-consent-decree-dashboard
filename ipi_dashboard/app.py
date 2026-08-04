@@ -61,22 +61,31 @@ def _viewer_email() -> str:
 
 def can_edit() -> bool:
     """True if this viewer may use write actions (queue research, review
-    contacts). Controlled by an `editors` list in Streamlit secrets:
+    contacts). Two mechanisms, either grants access:
 
-        editors = ["tedrickc@gmail.com", "someone@ipi-pipe.com"]
+    1. `editor_passcode = "..."` in Streamlit secrets — viewers unlock
+       their session by entering it in the sidebar. (Primary mechanism:
+       Streamlit Community Cloud does not expose viewer emails to apps
+       without a full OAuth setup.)
+    2. `editors = ["a@b.com", ...]` — automatic, but only effective if
+       the platform provides st.user.email (kept as a future upgrade).
 
-    If the secret is absent, everyone with access can edit (single-team
-    mode — today's behavior). Local development is always unrestricted.
+    If NEITHER secret is configured, everyone with app access can edit
+    (single-team mode). Local development is always unrestricted.
     """
     if not _RUNNING_ON_CLOUD:
+        return True
+    if st.session_state.get("_editor_unlocked"):
         return True
     try:
         editors = [str(e).strip().lower() for e in st.secrets.get("editors", [])]
     except Exception:
         editors = []
-    if not editors:
-        return True
-    return _viewer_email() in editors
+    email = _viewer_email()
+    if editors and email:
+        return email in editors
+    has_passcode = bool(str(st.secrets.get("editor_passcode", "") or "").strip())
+    return not (editors or has_passcode)
 
 
 # ---------------------------------------------------------------------------
@@ -1267,22 +1276,27 @@ def render_record_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
 def render_sidebar_utilities():
     """Sidebar keeps only global utilities: identity, freshness, reload,
     data quality."""
-    # Who does the app think you are? (This is what the editors list is
-    # checked against — surfacing it makes access issues self-diagnosing.)
+    # Editor access state + passcode unlock (Community Cloud doesn't give
+    # apps the viewer's email, so identity-based gating can't work there)
     if _RUNNING_ON_CLOUD:
-        email = _viewer_email()
-        if not email:
-            st.sidebar.caption(
-                "Signed in as: **not detected** — write actions are "
-                "view-only because the app can't read your login email."
-            )
-        elif can_edit():
-            st.sidebar.caption(f"Signed in as: **{email}** (editor)")
+        if can_edit():
+            st.sidebar.caption("**Editor access unlocked** for this session.")
         else:
             st.sidebar.caption(
-                f"Signed in as: **{email}** (view-only — this email isn't "
-                "on the editors list)"
+                "**View-only access.** Enter the editor passcode to enable "
+                "queueing and contact review:"
             )
+            code = st.sidebar.text_input(
+                "Editor passcode", type="password", key="_editor_code",
+                label_visibility="collapsed", placeholder="Editor passcode",
+            )
+            if st.sidebar.button("Unlock editor access", key="_editor_unlock_btn"):
+                expected = str(st.secrets.get("editor_passcode", "") or "").strip()
+                if expected and code == expected:
+                    st.session_state["_editor_unlocked"] = True
+                    st.rerun()
+                else:
+                    st.sidebar.error("That passcode isn't right.")
     # --- Data Refresh (local only — ETL can't run on Streamlit Cloud) ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Data Refresh")
