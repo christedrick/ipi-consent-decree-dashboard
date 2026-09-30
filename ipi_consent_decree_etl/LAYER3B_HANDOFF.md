@@ -1,5 +1,12 @@
 # Layer 3b Handoff — Stakeholder Research (Cowork task)
 
+> **Superseded (2026-09-29).** The live process is the `ipi-contact-research`
+> skill (`.claude/skills/ipi-contact-research/SKILL.md`, symlinked into
+> `~/.claude/skills/`) run by a daily noon Claude scheduled task, with all
+> BigQuery reads/writes through `research_cli.py`. The IPI Dashboard Claude
+> Project is the manual fallback (attach the same SKILL.md there). Kept
+> below for history: roster rationale, USVI caveat.
+
 This build (Layers 1–5) produces the qualified target list; finding the
 humans is a **separate research task** to run in Cowork against the
 artifacts below. Texas is the pilot batch (existing HB 500-style funding

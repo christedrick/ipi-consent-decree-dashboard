@@ -597,24 +597,14 @@ def remove_from_queue(keys: list) -> int:
     return job.num_dml_affected_rows or 0
 
 
-COWORK_QUEUE_PROMPT = """\
-Research municipal contacts for IPI. Read the queue:
-  SELECT * FROM `ipi-consent-decree-dashboard.ipi_intelligence.research_queue`
-  WHERE status = 'queued' ORDER BY priority_score DESC
-For each municipality find: water/utility director, mayor, city council or
-board members (flag public-works/infrastructure/finance committees), city
-manager or public works director, county commissioners if the utility is
-county-run, and the district's state legislator(s). Every contact row needs
-email and/or LinkedIn profile URL (email -> HubSpot Sequence, LinkedIn ->
-HeyReach); a name with neither doesn't count. Sources in order: Ballotpedia,
-the municipal website, Clay waterfall (low-confidence until spot-checked),
-LinkedIn Sales Navigator to verify. Write rows to
-`ipi_intelligence.stakeholders_staging` (stakeholder_id = new UUID,
-municipality_key from the queue row, verified = FALSE, hubspot_sync_status =
-'pending', ipi_audience_segment = 'State Representative' for political roles,
-IPI's operational segment for water/utility staff). When a municipality is
-fully researched, set its research_queue.status = 'done'. Full brief:
-ipi_consent_decree_etl/LAYER3B_HANDOFF.md in the IPI Dashboard repo.\
+# Research runs automatically (daily noon Claude scheduled task using the
+# ipi-contact-research skill). This prompt is the manual fallback for the
+# IPI Dashboard Claude Project, which has the skill's SKILL.md attached.
+FALLBACK_RESEARCH_PROMPT = """\
+Run IPI contact research on the queued municipalities, following the
+ipi-contact-research skill (SKILL.md in this project). Research mode only:
+contacts land as 'pending' for review on the dashboard; do not write to
+HubSpot. If you can't reach BigQuery from here, give me the rows as a CSV.\
 """
 
 
@@ -631,7 +621,7 @@ def load_pending_stakeholders() -> pd.DataFrame:
         return client.query("""
             SELECT stakeholder_id, city, state, full_name, role_title,
                    role_category, committee, email, phone, linkedin_url,
-                   source, source_url, confidence
+                   source, source_url, confidence, research_notes
             FROM `ipi_intelligence.stakeholders_staging`
             WHERE hubspot_sync_status = 'pending'
             ORDER BY state, city, role_category
@@ -707,8 +697,8 @@ def render_contact_review():
     pending = load_pending_stakeholders()
     if pending.empty:
         st.info(
-            "Nothing to review. New contacts appear here after a Cowork "
-            "research run finishes (they arrive as 'pending')."
+            "Nothing to review. New contacts appear here after the daily "
+            "research run (noon) finishes — they arrive as 'pending'."
         )
         return
 
@@ -726,7 +716,7 @@ def render_contact_review():
         column_order=[
             "approve", "reject", "city", "state", "full_name", "role_title",
             "role_category", "committee", "email", "phone", "linkedin_url",
-            "source", "source_url", "confidence",
+            "source", "source_url", "confidence", "research_notes",
         ],
         column_config={
             "approve": st.column_config.CheckboxColumn("Approve"),
@@ -743,6 +733,7 @@ def render_contact_review():
             "source": st.column_config.TextColumn("Source", width="small", disabled=True),
             "source_url": st.column_config.LinkColumn("Source Link", display_text="open"),
             "confidence": st.column_config.TextColumn("Confidence", width="small", disabled=True),
+            "research_notes": st.column_config.TextColumn("Notes", disabled=True),
         },
         use_container_width=True,
         height=380,
@@ -902,7 +893,7 @@ def render_top_targets(targets: pd.DataFrame):
 
     st.caption(
         "Tick rows, then click **Queue for contact research** — queued "
-        "municipalities flow to the Cowork research run (prompt below), and "
+        "municipalities are researched automatically at noon each day, and "
         "researched contacts land in HubSpot after review."
     )
 
@@ -1005,7 +996,7 @@ def render_top_targets(targets: pd.DataFrame):
 
     queue = load_research_queue()
     with st.expander(
-        f"Contact research queue ({len(queue)} municipalities) + Cowork prompt",
+        f"Contact research queue ({len(queue)} municipalities)",
         expanded=False,
     ):
         if not queue.empty:
@@ -1054,8 +1045,16 @@ def render_top_targets(targets: pd.DataFrame):
                         st.rerun()
                     except Exception:
                         st.error("Couldn't clear the queue — check BigQuery access and try again.")
-        st.markdown("**Paste this into Cowork to run the research:**")
-        st.code(COWORK_QUEUE_PROMPT, language=None)
+        st.caption(
+            "Claude researches everything with status **queued** every day at "
+            "noon (while the Mac and Claude app are on) and moves it to "
+            "**researching**, then **done**; contacts land in Contact Review "
+            "as pending. Nothing reaches HubSpot until you approve it here and "
+            "ask Claude to sync."
+        )
+        st.markdown("**Fallback — paste into the IPI Dashboard Claude Project "
+                    "to run research by hand:**")
+        st.code(FALLBACK_RESEARCH_PROMPT, language=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1750,9 +1749,10 @@ The dashboard is organized as three tabs:
 1. **Lead Pipeline** (the money view) — one row per qualified municipality
    (Medium/Large with an active signal), ranked by **Priority Score**. The
    workflow runs left to right: tick promising targets → **Queue for contact
-   research** → run the Cowork prompt (in the queue expander) → researched
-   contacts come back to **Contact Review** → approve → they land in HubSpot
-   tagged with municipality, signal, and score. The **Live Incidents** feed
+   research** → Claude researches the queue automatically at noon →
+   researched contacts come back to **Contact Review** → approve → ask
+   Claude to sync approved contacts to HubSpot (tagged with municipality,
+   role, and segment; LinkedIn-only contacts included for HeyReach export). The **Live Incidents** feed
    below flags same-week outreach openings.
 2. **Map & Analytics** — record-grain exploration. The **Record Filters** at
    the top of this tab (case status, signal type, state, size, pipe-only,
@@ -1906,9 +1906,10 @@ Refresh**; the **Reload data now** button re-reads BigQuery immediately
 instead of within the hour. There is nothing to run manually.
 
 **Contact pipeline**: municipality research is queued from the Lead
-Pipeline tab, executed in Claude Cowork (Ballotpedia → municipal sites →
-Clay → LinkedIn verification), reviewed in **Contact Review**, and synced
-to HubSpot with `ipi_audience_segment` set per role. Only approved
+Pipeline tab and researched by a daily noon Claude task using the
+`ipi-contact-research` skill (official sites → Ballotpedia → Clay → web
+search for LinkedIn), reviewed in **Contact Review**, and synced to HubSpot
+on request with `ipi_audience_segment` set per role. Only approved
 contacts ever reach the CRM.
         """)
 
